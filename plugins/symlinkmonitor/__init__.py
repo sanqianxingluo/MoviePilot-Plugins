@@ -1,21 +1,31 @@
 """
-MoviePilot 软链接监控插件 (SymlinkMonitor)
+MoviePilot 软链接清理插件 (SymlinkMonitor)
 
-监控下载目录中的文件变化：
-  1. 新增文件 -> 在媒体库目录建立软链接（符号链接，可跨文件系统）；
-  2. 源文件被删除 -> 延迟若干秒确认后，联动清理：
-       · 对应的软链接
+**本插件不建立任何软链接。** 它只做一件事：盯着下载目录，发现文件被删除后
+延迟确认，再把软链接目录（媒体库）里指向它的那个软链接删掉，并联动清理
+刮削文件、转移记录、下载任务与空目录。
+
+  1. 监控下载目录中的文件变化；
+  2. 源文件被删除 -> 延迟若干秒确认为真删除后再清理：
+       · 软链接目录中指向该文件的软链接
        · 同名的刮削文件（nfo / 图片 / 字幕）与刮削目录
        · MoviePilot 转移记录
        · 下载器中的任务（种子，不删除数据）
        · 空目录
+  3. 「立即运行一次」= 全量清理一次：扫掉所有指向下载目录、但源文件已不存在
+     的孤儿软链接。
+
+安全约束：
+  · 只删除「软链接」本身，绝不删除软链接目录里的真实文件；
+  · 只删除指向监控目录的软链接，不碰无关链接；
+  · 「不删除目录」下的内容一律不动（不监控、不删链接）。
 
 配置项：
   enabled            启用插件
   notify             发送通知
-  onlyonce           立即运行一次（全量扫描一次）
-  monitor_dirs       监控目录，每行一条，格式「源目录」或「源目录:软链接目标目录」
-  exclude_dirs       不删除目录，每行一条；这些目录下的文件不建链、也永不删除
+  onlyonce           立即运行一次（全量清理孤儿链接）
+  monitor_dirs       监控目录，每行一条：「下载目录:软链接目录」
+  exclude_dirs       不删除目录，每行一条；这些目录下的内容永不删除
   exclude_keywords   排除关键词，每行一条，命中则忽略
   scan_interval      扫描间隔（秒）
   delayed_deletion   启用延迟删除
@@ -35,9 +45,8 @@ import os
 import re
 import shutil
 import threading
-import time
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -71,6 +80,9 @@ SCRAP_EXTENSIONS = {
 # 媒体服务器生成的关联刮削目录后缀
 SCRAP_DIR_SUFFIXES = {".trickplay", ".actors", ".thumbs"}
 
+# 遍历软链接目录时跳过的系统目录
+SKIP_DIR_NAMES = {"@eaDir", "#recycle", "@Recycle", ".Trash", ".stfolder"}
+
 _state_lock = threading.Lock()
 _queue_lock = threading.Lock()
 
@@ -79,11 +91,11 @@ class SymlinkMonitor(_PluginBase):
     # 插件名称
     plugin_name = "软链接监控"
     # 插件描述
-    plugin_desc = "监控下载目录并建立软链接；源文件删除后延迟联动清理软链接、刮削文件、转移记录与下载种子。"
+    plugin_desc = "监控下载目录，文件删除后延迟清理软链接目录中指向它的软链接，并联动清理刮削文件、转移记录与下载种子。"
     # 插件图标
     plugin_icon = "Linkace_C.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "2.0.0"
     # 插件作者
     plugin_author = "sanqianxingluo"
     # 作者主页
@@ -111,7 +123,7 @@ class SymlinkMonitor(_PluginBase):
     _clean_empty_dir = True
 
     # ---- 运行时状态 ----
-    # {源目录: 软链接目标目录}
+    # {下载目录: 软链接目录}
     _dirconf: Dict[str, Path] = {}
     # {源文件绝对路径: (size, mtime)}
     _snapshot: Dict[str, Tuple[int, float]] = {}
@@ -121,7 +133,7 @@ class SymlinkMonitor(_PluginBase):
     _thread: Optional[threading.Thread] = None
     _history = None
     # 本次运行统计
-    _stat = {"link": 0, "delete": 0, "fail": 0}
+    _stat = {"delete": 0, "link": 0, "sweep": 0, "fail": 0}
 
     # ------------------------------------------------------------------ 配置
 
@@ -156,19 +168,19 @@ class SymlinkMonitor(_PluginBase):
 
         self._history = TransferHistoryOper()
 
-        # 解析「源目录:目标目录」
+        # 解析「下载目录:软链接目录」
         for line in self._monitor_dirs.splitlines():
             line = line.strip()
             if not line:
                 continue
-            src, target = self._split_dir_conf(line)
-            if not target:
-                logger.warn(f"软链接监控：{src} 未配置软链接目标目录，跳过")
+            src, link_dir = self._split_dir_conf(line)
+            if not link_dir:
+                logger.warn(f"软链接监控：{src} 未配置软链接目录，跳过")
                 continue
-            if self._is_same_or_child(target, src):
-                logger.warn(f"软链接监控：目标目录 {target} 是监控目录 {src} 的子目录，跳过")
+            if self._is_same_or_child(link_dir, src):
+                logger.warn(f"软链接监控：软链接目录 {link_dir} 位于下载目录 {src} 内，跳过")
                 continue
-            self._dirconf[src] = target
+            self._dirconf[src] = link_dir
 
         if not (self._enabled or self._onlyonce):
             return
@@ -176,10 +188,10 @@ class SymlinkMonitor(_PluginBase):
             logger.warn("软链接监控：未配置有效的监控目录")
             return
 
-        # 建立基线快照
+        # 建立基线快照（只用于发现删除，不建链）
         self._snapshot = self._build_snapshot()
 
-        # 立即运行一次：补建缺失软链接
+        # 立即运行一次：全量清理孤儿软链接
         if self._onlyonce:
             self._onlyonce = False
             self._save_config()
@@ -189,9 +201,9 @@ class SymlinkMonitor(_PluginBase):
             self._thread = threading.Thread(target=self._loop, name="SymlinkMonitor", daemon=True)
             self._thread.start()
             logger.info(
-                f"软链接监控已启动，监控 {len(self._dirconf)} 个目录，"
-                f"扫描间隔 {self._scan_interval}s，延迟删除 {'开' if self._delayed_deletion else '关'}"
-                f"（{self._delay_seconds}s）"
+                f"软链接监控已启动，监控 {len(self._dirconf)} 个下载目录，"
+                f"扫描间隔 {self._scan_interval}s，延迟删除 "
+                f"{'开' if self._delayed_deletion else '关'}（{self._delay_seconds}s）"
             )
 
     def _save_config(self):
@@ -232,33 +244,26 @@ class SymlinkMonitor(_PluginBase):
             self._stop_event.wait(self._scan_interval)
 
     def _scan_once(self):
-        """扫描一次监控目录，处理新增与删除。"""
+        """扫描一次下载目录：只关心「文件消失了」。"""
         current = self._build_snapshot()
         with _state_lock:
             old = self._snapshot
-        added = [p for p in current if p not in old]
         removed = [p for p in old if p not in current]
-        # 文件大小/修改时间变化的文件按新增处理（下载完成、改名等）
-        changed = [p for p in current if p in old and current[p] != old[p]]
-
-        for path in added + changed:
-            self._create_link(Path(path))
-
         for path in removed:
             self._enqueue_deletion(path)
-
         with _state_lock:
             self._snapshot = current
 
     def _build_snapshot(self) -> Dict[str, Tuple[int, float]]:
-        """建立监控目录的文件快照。"""
+        """建立下载目录的文件快照。"""
         snap: Dict[str, Tuple[int, float]] = {}
         for src in self._dirconf:
             base = Path(src)
             if not base.is_dir():
                 logger.warn(f"软链接监控：监控目录不存在 {src}")
                 continue
-            for root, _dirs, files in os.walk(base):
+            for root, dirs, files in os.walk(base):
+                dirs[:] = [d for d in dirs if d not in SKIP_DIR_NAMES]
                 for name in files:
                     fp = Path(root) / name
                     key = str(fp)
@@ -272,7 +277,7 @@ class SymlinkMonitor(_PluginBase):
         return snap
 
     def _skip_file(self, path: Path, key: str = None) -> bool:
-        """判断文件是否应跳过（临时文件 / 隐藏 / 回收站 / 排除关键词 / 不删除目录）。"""
+        """判断文件是否应跳过（临时 / 隐藏 / 回收站 / 排除关键词 / 不删除目录）。"""
         key = key or str(path)
         if path.suffix.lower() in TMP_SUFFIXES:
             return True
@@ -290,71 +295,125 @@ class SymlinkMonitor(_PluginBase):
                     return True
         return False
 
-    # -------------------------------------------------------------- 建软链接
+    # -------------------------------------------------------------- 软链接定位
 
-    def _create_link(self, src: Path) -> bool:
-        """为源文件在目标目录建立软链接。"""
-        mon_path = self._owner_of(src)
-        if not mon_path:
-            return False
-        target = self._dirconf.get(mon_path)
-        if not target:
-            return False
-        try:
-            rel = src.relative_to(Path(mon_path))
-        except ValueError:
-            return False
-        dest = target / rel
-        if dest.exists() or dest.is_symlink():
-            return True
-        try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            os.symlink(str(src), str(dest))
-            self._stat["link"] += 1
-            logger.info(f"软链接监控：建立软链接 {dest} -> {src}")
-            if self._notify:
-                self.post_message(
-                    mtype=NotificationType.SiteMessage,
-                    title="🔗 已建立软链接",
-                    text=f"源文件：{src}\n软链接：{dest}",
-                )
-            return True
-        except OSError as e:
-            self._stat["fail"] += 1
-            logger.error(f"软链接监控：建立软链接失败 {dest} -> {src}：{e}")
-            if self._notify:
-                self.post_message(
-                    mtype=NotificationType.SiteMessage,
-                    title="🔗 建立软链接失败",
-                    text=f"源文件：{src}\n原因：{e}",
-                )
-            return False
+    def _owner_of(self, path) -> Optional[str]:
+        """返回 path 所属的下载目录。"""
+        key = str(path)
+        for src in self._dirconf:
+            if key == src or key.startswith(src.rstrip("/") + "/"):
+                return src
+        return None
+
+    def _link_dir_of(self, src) -> Optional[Path]:
+        """返回源文件所属下载目录对应的软链接目录。"""
+        mon = self._owner_of(src)
+        return self._dirconf.get(mon) if mon else None
 
     def _link_path_of(self, src: str) -> Optional[Path]:
-        """由源文件路径推导出对应的软链接路径。"""
-        mon_path = self._owner_of(Path(src))
-        if not mon_path:
-            return None
-        target = self._dirconf.get(mon_path)
-        if not target:
+        """由下载目录中的源文件路径，直接推导软链接目录中的同名路径。"""
+        mon = self._owner_of(Path(src))
+        link_dir = self._dirconf.get(mon) if mon else None
+        if not link_dir:
             return None
         try:
-            rel = Path(src).relative_to(Path(mon_path))
+            rel = Path(src).relative_to(Path(mon))
         except ValueError:
             return None
-        return target / rel
+        return link_dir / rel
 
-    def sync_all(self):
-        """全量扫描一次：补建缺失的软链接。"""
-        logger.info("软链接监控：开始全量扫描")
-        snap = self._build_snapshot()
-        with _state_lock:
-            self._snapshot = snap
+    @staticmethod
+    def _iter_entries(base: Path):
+        """遍历软链接目录下的所有条目（不跟随软链接）。"""
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIR_NAMES]
+            for name in list(dirs) + files:
+                yield Path(root) / name
+
+    @staticmethod
+    def _target_of(link: Path) -> Optional[Path]:
+        """读取软链接指向的目标绝对路径；相对目标按链接所在目录解析。"""
+        try:
+            raw = os.readlink(link)
+        except OSError:
+            return None
+        target = Path(raw)
+        if not target.is_absolute():
+            target = link.parent / target
+        return Path(os.path.normpath(str(target)))
+
+    def _find_links(self, src: str) -> List[Path]:
+        """找出软链接目录中指向源文件 src 的所有软链接。"""
+        found: List[Path] = []
+        seen = set()
+
+        def add(p: Path):
+            key = str(p)
+            if key not in seen:
+                seen.add(key)
+                found.append(p)
+
+        # 1. 直接推导（下载目录 -> 软链接目录，同名相对路径）
+        direct = self._link_path_of(src)
+        if direct and direct.is_symlink():
+            add(direct)
+
+        # 2. 扫描软链接目录，按链接目标匹配（应对改名、分类目录等情形）
+        mon = self._owner_of(src)
+        link_dir = self._dirconf.get(mon) if mon else None
+        if link_dir and link_dir.is_dir():
+            src_norm = self._norm(src)
+            for entry in self._iter_entries(link_dir):
+                if str(entry) in seen or not entry.is_symlink():
+                    continue
+                target = self._target_of(entry)
+                if target is not None and self._norm(target) == src_norm:
+                    add(entry)
+        return found
+
+    def _orphan_links(self) -> List[Path]:
+        """全量扫描：找出指向监控目录、但源文件已不存在的断链（孤儿）。"""
+        orphans: List[Path] = []
+        for mon, link_dir in self._dirconf.items():
+            if not link_dir.is_dir():
+                logger.warn(f"软链接监控：软链接目录不存在 {link_dir}")
+                continue
+            for entry in self._iter_entries(link_dir):
+                if not entry.is_symlink():
+                    continue
+                if entry.exists():  # 链接有效
+                    continue
+                target = self._target_of(entry)
+                if target is None:
+                    continue
+                # 只处理指向监控目录的断链
+                if not self._is_same_or_child(target, mon):
+                    continue
+                if self._is_excluded(entry) or self._is_excluded(target):
+                    continue
+                orphans.append(entry)
+        return orphans
+
+    def sync_all(self) -> int:
+        """全量清理一次：删除所有孤儿软链接，并重建快照。"""
+        logger.info("软链接监控：开始全量清理孤儿链接")
         count = 0
-        for key in snap:
-            if self._create_link(Path(key)):
+        for link in self._orphan_links():
+            try:
+                link.unlink()
                 count += 1
-        logger.info(f"软链接监控：全量扫描完成，处理 {count} 个文件")
+                self._stat["sweep"] += 1
+                logger.info(f"软链接监控：已清理孤儿软链接 {link}")
+                if self._delete_scrap:
+                    self._delete_scrap_files(link)
+                if self._clean_empty_dir:
+                    self._clean_empty_dirs(link.parent)
+            except OSError as e:
+                self._stat["fail"] += 1
+                logger.error(f"软链接监控：清理孤儿软链接 {link} 失败：{e}")
+        with _state_lock:
+            self._snapshot = self._build_snapshot()
+        logger.info(f"软链接监控：全量清理完成，共清理 {count} 个孤儿软链接")
         return count
 
     # -------------------------------------------------------------- 延迟删除
@@ -363,10 +422,6 @@ class SymlinkMonitor(_PluginBase):
         """把删除事件放入延迟队列。"""
         if self._is_excluded(Path(src)):
             logger.info(f"软链接监控：{src} 在不删除目录中，忽略删除")
-            return
-        link = self._link_path_of(src)
-        if link and self._is_excluded(link):
-            logger.info(f"软链接监控：软链接 {link} 在不删除目录中，忽略删除")
             return
         if not self._delayed_deletion:
             self._execute_deletion(src)
@@ -396,52 +451,60 @@ class SymlinkMonitor(_PluginBase):
                 logger.error(f"软链接监控：清理 {src} 失败：{e} - {traceback.format_exc()}")
 
     def _execute_deletion(self, src: str):
-        """执行一次完整的联动清理。"""
+        """执行一次完整的联动清理（绝不删除软链接目录中的真实文件）。"""
         src_path = Path(src)
-        # 源文件又回来了（重新下载/改名）则跳过硬链接删除，只清理旧刮削文件
+        # 源文件又回来了（重新下载 / 改名）则跳过
         if src_path.exists():
             logger.info(f"软链接监控：源文件 {src} 已重新出现，跳过清理")
-            if self._delete_scrap:
-                self._delete_scrap_files(src_path)
             return
 
         removed: List[str] = []
+        links = self._find_links(src)
 
-        # 1. 删除软链接
-        link = self._link_path_of(src)
-        if link and (link.is_symlink() or link.exists()):
+        # 1. 删除指向该源文件的软链接
+        for link in links:
+            if self._is_excluded(link):
+                logger.info(f"软链接监控：{link} 在不删除目录中，跳过")
+                continue
+            if not link.is_symlink():
+                # 安全兜底：软链接目录中的真实文件一律不动
+                logger.warn(f"软链接监控：{link} 不是软链接，跳过删除")
+                continue
             try:
-                if link.is_dir() and not link.is_symlink():
-                    shutil.rmtree(link)
-                else:
-                    link.unlink()
+                link.unlink()
                 removed.append(str(link))
-                logger.info(f"软链接监控：已删除软链接 {link}")
+                logger.info(f"软链接监控：已删除软链接 {link} -> {src}")
             except OSError as e:
+                self._stat["fail"] += 1
                 logger.error(f"软链接监控：删除软链接 {link} 失败：{e}")
 
-        # 2. 清理刮削文件
+        # 2. 清理刮削文件（软链接目录侧 + 下载目录侧的同名残留）
         if self._delete_scrap:
-            self._delete_scrap_files(src_path)
-            if link:
+            for link in links:
                 self._delete_scrap_files(link)
+            self._delete_scrap_files(src_path)
 
         # 3. 删除转移记录 + 4. 联动删除种子
         hash_str = self._delete_transfer_history(src)
         if self._delete_torrents:
-            self._delete_torrent(hash_str, src, link)
+            self._delete_torrent(hash_str, src, links[0] if links else None)
 
-        # 5. 清理空目录（含只剩刮削文件的目录，如残留的 poster.jpg）
+        # 5. 清理空目录（含只剩刮削文件的目录）
         if self._clean_empty_dir:
-            for p in filter(None, (link, src_path)):
+            for p in list(links) + [src_path]:
                 if self._delete_scrap:
                     self._purge_only_scrap_dirs(p.parent)
                 self._clean_empty_dirs(p.parent)
 
         self._stat["delete"] += 1
+        self._stat["link"] += len(removed)
         if self._notify:
             lines = [f"🗂️ 源文件：{src}"]
-            lines.append(f"🔗 软链接：{removed[0] if removed else '（未找到）'}")
+            if removed:
+                lines.append("🔗 已删除软链接：")
+                lines.extend(f"　　{x}" for x in removed)
+            else:
+                lines.append("🔗 未找到对应软链接")
             if self._delete_scrap:
                 lines.append("🖼️ 已清理刮削文件")
             if self._delete_history:
@@ -453,7 +516,7 @@ class SymlinkMonitor(_PluginBase):
             self.post_message(
                 mtype=NotificationType.SiteMessage,
                 title="🧹 软链接联动清理",
-                text=f"⏰ 延迟删除完成\n\n" + "\n".join(lines),
+                text="⏰ 延迟删除完成\n\n" + "\n".join(lines),
             )
 
     def _delete_transfer_history(self, src: str) -> Optional[str]:
@@ -484,6 +547,9 @@ class SymlinkMonitor(_PluginBase):
             services = DownloaderHelper().get_services()
             if not services:
                 return
+            wanted = {str(src)}
+            if link:
+                wanted.add(str(link))
             for _name, info in services.items():
                 inst = info.instance
                 if inst.is_inactive():
@@ -494,7 +560,7 @@ class SymlinkMonitor(_PluginBase):
                     name = getattr(t, "name", None)
                     if not save or not name:
                         continue
-                    if str(Path(save) / name) == str(src) or (link and str(Path(save) / name) == str(link)):
+                    if str(Path(save) / name) in wanted:
                         tid = getattr(t, "hash", None) or getattr(t, "hashString", None)
                         if tid:
                             inst.delete_torrents(delete_file=False, ids=[tid])
@@ -504,34 +570,47 @@ class SymlinkMonitor(_PluginBase):
             logger.error(f"软链接监控：联动删除种子失败 {src}：{e}")
 
     def _delete_scrap_files(self, path: Path):
-        """清理与 path 同名的刮削文件 / 刮削目录。"""
-        if not path.parent.is_dir():
+        """清理与 path 同名的刮削文件 / 刮削目录。
+
+        匹配规则：条目名 == 媒体名，或为「媒体名 + -._ 分隔的附加部分」
+        （如 movie-poster.jpg / movie.zh.srt / movie.trickplay），
+        因此「电影AB」不会被「电影A」误伤。
+        """
+        parent = path.parent
+        if not parent.is_dir():
             return
-        prefix = path.stem
+        prefix = path.name.rsplit(".", 1)[0] if "." in path.name else path.name
+        if not prefix:
+            return
+        pattern = re.compile(r"^%s([-._].*)?$" % re.escape(prefix))
         try:
-            for item in path.parent.iterdir():
+            for item in parent.iterdir():
                 if item == path:
                     continue
-                if not item.name.startswith(prefix):
+                stem = item.name.rsplit(".", 1)[0] if "." in item.name else item.name
+                if not pattern.match(stem):
                     continue
+                if self._is_excluded(item):
+                    continue
+                suffix = item.suffix.lower()
                 try:
-                    if item.is_dir():
-                        if item.suffix.lower() in SCRAP_DIR_SUFFIXES:
+                    if item.is_dir() and not item.is_symlink():
+                        if suffix in SCRAP_DIR_SUFFIXES:
                             shutil.rmtree(item, ignore_errors=True)
                             logger.info(f"软链接监控：已删除刮削目录 {item}")
-                    elif item.suffix.lower() in SCRAP_EXTENSIONS:
+                    elif suffix in SCRAP_EXTENSIONS:
                         item.unlink()
                         logger.info(f"软链接监控：已删除刮削文件 {item}")
                 except OSError as e:
                     logger.error(f"软链接监控：删除刮削文件 {item} 失败：{e}")
         except OSError as e:
-            logger.error(f"软链接监控：遍历刮削文件失败 {path.parent}：{e}")
+            logger.error(f"软链接监控：遍历刮削文件失败 {parent}：{e}")
 
     def _is_only_scrap(self, path: Path) -> bool:
-        """目录内是否只剩刮削文件/刮削目录（说明媒体本体已不在）。"""
+        """目录内是否只剩刮削文件 / 刮削目录（说明媒体本体已不在）。"""
         try:
             for item in path.iterdir():
-                if item.is_dir():
+                if item.is_dir() and not item.is_symlink():
                     if item.suffix.lower() not in SCRAP_DIR_SUFFIXES:
                         return False
                 elif item.suffix.lower() not in SCRAP_EXTENSIONS:
@@ -541,15 +620,15 @@ class SymlinkMonitor(_PluginBase):
         return True
 
     def _purge_only_scrap_dirs(self, path: Optional[Path]):
-        """自下而上清理「只剩刮削文件」的目录，直到遇到监控目录根或不删除目录。"""
+        """自下而上清理「只剩刮削文件」的目录，直到遇到根或不删除目录。"""
         while path is not None:
-            if self._is_excluded(path) or str(path) in self._dirconf or not path.is_dir():
+            if self._is_excluded(path) or self._is_stop_dir(path) or not path.is_dir():
                 return
             if not self._is_only_scrap(path):
                 return
             try:
                 for item in list(path.iterdir()):
-                    if item.is_dir():
+                    if item.is_dir() and not item.is_symlink():
                         shutil.rmtree(item, ignore_errors=True)
                     else:
                         item.unlink()
@@ -560,11 +639,9 @@ class SymlinkMonitor(_PluginBase):
             path = path.parent
 
     def _clean_empty_dirs(self, path: Optional[Path]):
-        """自下而上清理空目录，遇到监控目录根或不删除目录停止。"""
+        """自下而上清理空目录，遇到收尾边界或不删除目录停止。"""
         while path is not None:
-            if self._is_excluded(path):
-                return
-            if str(path) in self._dirconf or not path.is_dir():
+            if self._is_excluded(path) or self._is_stop_dir(path) or not path.is_dir():
                 return
             try:
                 if any(path.iterdir()):
@@ -579,7 +656,7 @@ class SymlinkMonitor(_PluginBase):
 
     @staticmethod
     def _split_dir_conf(line: str) -> Tuple[str, Optional[Path]]:
-        """解析「源目录:目标目录」，兼容 Windows 盘符。"""
+        """解析「下载目录:软链接目录」，兼容 Windows 盘符。"""
         if os.name == "nt" and line.count(":") > 1:
             parts = [line.split(":")[0] + ":" + line.split(":")[1],
                      ":".join(line.split(":")[2:])]
@@ -589,13 +666,12 @@ class SymlinkMonitor(_PluginBase):
         target = Path(parts[1].strip()) if len(parts) > 1 and parts[1].strip() else None
         return src, target
 
-    def _owner_of(self, path: Path) -> Optional[str]:
-        """返回 path 所属的监控目录。"""
+    def _is_stop_dir(self, path) -> bool:
+        """是否到达收尾边界：下载目录根 或 软链接目录根。"""
         key = str(path)
-        for src in self._dirconf:
-            if key == src or key.startswith(src.rstrip("/") + "/"):
-                return src
-        return None
+        if key in self._dirconf:
+            return True
+        return any(key == str(v) for v in self._dirconf.values())
 
     @staticmethod
     def _norm(p) -> str:
@@ -625,8 +701,9 @@ class SymlinkMonitor(_PluginBase):
         """运行状态描述。"""
         return (
             f"监控目录 {len(self._dirconf)} 个｜快照 {len(self._snapshot)} 个文件｜"
-            f"待清理 {len(self._deletion_queue)} 项｜本次已建链 {self._stat['link']}、"
-            f"已清理 {self._stat['delete']}、失败 {self._stat['fail']}"
+            f"待清理 {len(self._deletion_queue)} 项｜已删链接 {self._stat['link']}、"
+            f"已处理 {self._stat['delete']} 次、孤儿清理 {self._stat['sweep']}、"
+            f"失败 {self._stat['fail']}"
         )
 
     # -------------------------------------------------------------- 宿主接口
@@ -637,7 +714,7 @@ class SymlinkMonitor(_PluginBase):
         return [{
             "cmd": "/symlink_monitor",
             "event": EventType.PluginAction,
-            "desc": "软链接监控全量扫描",
+            "desc": "软链接监控全量清理孤儿链接",
             "category": "管理",
             "data": {"action": "symlink_monitor"},
         }]
@@ -653,8 +730,8 @@ class SymlinkMonitor(_PluginBase):
         self.post_message(
             channel=event.event_data.get("channel"),
             userid=event.event_data.get("user"),
-            title="🔗 软链接监控完成",
-            text=self.status_text() + f"\n本次处理 {count} 个文件",
+            title="🧹 软链接监控完成",
+            text=self.status_text() + f"\n本次清理 {count} 个孤儿软链接",
         )
 
     def get_api(self) -> List[Dict[str, Any]]:
@@ -666,7 +743,7 @@ class SymlinkMonitor(_PluginBase):
                 "methods": ["GET"],
                 "auth": "bear",
                 "summary": "立即运行一次",
-                "description": "全量扫描监控目录并补建软链接",
+                "description": "全量清理一次：删除所有指向下载目录的孤儿软链接",
             },
             {
                 "path": "/status",
@@ -688,12 +765,13 @@ class SymlinkMonitor(_PluginBase):
         return {"success": True, "data": {
             "enabled": self._enabled,
             "monitor_dirs": list(self._dirconf.keys()),
+            "link_dirs": [str(v) for v in self._dirconf.values()],
             "exclude_dirs": [x.strip() for x in self._exclude_dirs.splitlines() if x.strip()],
             "status": self.status_text(),
         }}
 
     def get_service(self) -> List[Dict[str, Any]]:
-        """注册周期服务（在插件重载后仍能继续清理到期的延迟任务）。"""
+        """注册周期服务（插件重载后仍能继续清理到期的延迟任务）。"""
         if not self._enabled:
             return []
         return [{
@@ -711,9 +789,11 @@ class SymlinkMonitor(_PluginBase):
             "props": {
                 "type": "info",
                 "variant": "tonal",
-                "title": "🔗 软链接监控",
-                "text": ("监控目录中的新增文件会自动在目标目录建立软链接；"
-                         "源文件删除后会延迟确认，再联动清理软链接、刮削文件、转移记录与下载种子。\n\n"
+                "title": "🧹 软链接监控",
+                "text": ("本插件不建立软链接，只做清理：下载目录中的文件被删除后，"
+                         "延迟确认为真删除，再删掉软链接目录中指向它的软链接，"
+                         "并联动清理刮削文件、转移记录、下载种子与空目录。\n\n"
+                         "「立即运行一次」会全量清理一次孤儿链接。\n\n"
                          + self.status_text()),
             },
         }]
@@ -760,11 +840,13 @@ class SymlinkMonitor(_PluginBase):
                                     "component": "VTextarea",
                                     "props": {
                                         "model": "monitor_dirs",
-                                        "label": "监控目录（源目录:软链接目标目录）",
+                                        "label": "监控目录（下载目录:软链接目录）",
                                         "rows": 5,
                                         "placeholder": "每一行一条，例如：\n"
                                                        "/downloads/电影:/media/电影\n"
-                                                       "/downloads/剧集:/media/剧集",
+                                                       "/downloads/剧集:/media/剧集\n\n"
+                                                       "下载目录中的文件被删除后，"
+                                                       "会删除软链接目录中指向它的软链接。",
                                     },
                                 }],
                             },
@@ -782,7 +864,7 @@ class SymlinkMonitor(_PluginBase):
                                         "model": "exclude_dirs",
                                         "label": "不删除目录",
                                         "rows": 3,
-                                        "placeholder": "每一行一个目录；这些目录下的文件不建立软链接，也永远不会被本插件删除\n"
+                                        "placeholder": "每一行一个目录；这些目录下的内容永不删除，也不监控\n"
                                                        "（含其子目录）",
                                     },
                                 }],
@@ -818,7 +900,8 @@ class SymlinkMonitor(_PluginBase):
                                     "props": {
                                         "type": "info",
                                         "variant": "tonal",
-                                        "text": "软链接可跨文件系统，便于下载盘与媒体库分盘存放。"
+                                        "text": "本插件只删除软链接，绝不会删除软链接目录中的真实文件；"
+                                                "也不处理指向其他位置的无关链接。"
                                                 "联动删除种子只移除下载任务、不删除文件数据。",
                                     },
                                 }],
