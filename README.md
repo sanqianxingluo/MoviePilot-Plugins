@@ -2,11 +2,13 @@
 
 个人维护的 MoviePilot 插件仓库，可直接作为 `PLUGIN_MARKET` 源使用。
 
+遵循 [jxxghp/MoviePilot-Plugins](https://github.com/jxxghp/MoviePilot-Plugins) 的仓库规范（见其 `docs/Repository_Guide.md`）。
+
 ## 插件列表
 
 | 插件 | 说明 | 版本 |
 | --- | --- | --- |
-| [软链接监控](plugins/symlinkmonitor/README.md) | 只监控不建链：下载目录文件删除后，延迟清理软链接目录中指向它的链接，并联动清理刮削文件、转移记录与下载种子 | 2.0.0 |
+| [软链接监控](plugins/symlinkmonitor/README.md) | 只监控不建链：下载目录文件删除后，延迟清理软链接目录中指向它的链接，并联动清理刮削文件、转移记录与下载种子 | 2.2.3 |
 
 ## 使用方法
 
@@ -35,16 +37,29 @@ https://github.com/sanqianxingluo/moviepilot-plugins
 
 ```
 .
-├── package.json                 # 插件索引（V2/V3 通用）
+├── package.json                 # 插件索引（V2/V3 通用，本插件声明 v2: true）
+├── LICENSE                      # GPL-3.0
 ├── icons/                       # 插件图标
-├── plugins/                     # V1/V2 兼容实现（package.json 里 v2: true 时生效）
+├── plugins/                     # 插件实现（package.json 声明 v2: true 时由 V2 宿主加载）
 │   └── symlinkmonitor/
-└── plugins.v2/                  # V2 专用实现目录（可选）
+└── tests/
+    └── v2/
+        └── symlinkmonitor/      # 单测（需在 MoviePilot 容器内运行，见 tests/README.md）
 ```
 
-MoviePilot 按 `VERSION_FLAG` 选择目录：V2 宿主读 `package.v2.json` + `plugins.v2/`，
-回退读 `package.json` + `plugins/`。
+**一个插件只保留一套实现。** 不要同时放 `plugins/` 与 `plugins.v2/` 的同名副本：
+宿主按 `VERSION_FLAG` 只会加载其中一个，重复副本会造成「改一处、漏一处」。
+
+## 版本目录解析规则（宿主实测）
+
+宿主按 `VERSION_FLAG` 依次尝试：
+
+1. `package.v2.json` 里有该插件 → 加载 `plugins.v2/<id>/`
+2. 否则看 `package.json`，若该插件 `"v2": true` → 加载 `plugins/<id>/`
+3. 都没有 → 插件不可用
+
+因此只需 V2 兼容、不需要单独维护代码目录时，**只放 `package.json` + `plugins/` + `"v2": true`** 即可。
 
 ## 许可
 
-MIT
+GPL-3.0（与官方插件仓一致，见 [LICENSE](LICENSE)）。
