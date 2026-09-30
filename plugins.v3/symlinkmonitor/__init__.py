@@ -95,7 +95,7 @@ class SymlinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkace_C.png"
     # 插件版本
-    plugin_version = "2.0.0"
+    plugin_version = "2.0.1"
     # 插件作者
     plugin_author = "sanqianxingluo"
     # 作者主页
@@ -181,6 +181,10 @@ class SymlinkMonitor(_PluginBase):
                 logger.warn(f"软链接监控：软链接目录 {link_dir} 位于下载目录 {src} 内，跳过")
                 continue
             self._dirconf[src] = link_dir
+
+        # 防呆：「不删除目录」若覆盖了监控目录（或其父目录），该区域的文件将永远
+        # 不进快照，删除事件彻底失灵 —— 必须在启动前拦住。
+        self._dirconf = self._drop_self_excluded(self._dirconf)
 
         if not (self._enabled or self._onlyonce):
             return
@@ -673,6 +677,31 @@ class SymlinkMonitor(_PluginBase):
             return True
         return any(key == str(v) for v in self._dirconf.values())
 
+    def _drop_self_excluded(self, dirconf: Dict[str, Path]) -> Dict[str, Path]:
+        """剔除被「不删除目录」覆盖的监控目录，并对剩余项剔除被覆盖的软链接目录。
+
+        「不删除目录」的意义是「不删这里的文件」，把监控目录放进去会让该区域的
+        文件永远不进快照、删除事件彻底失灵，且孤儿清理也会一并跳过。这里直接
+        拦下并给出明确告警，避免静默失效。
+        """
+        kept: Dict[str, Path] = {}
+        for src, link_dir in dirconf.items():
+            if self._is_excluded(src):
+                logger.error(
+                    f"软链接监控：监控目录 {src} 被「不删除目录」覆盖 —— "
+                    f"该目录下的文件不会被监控，删除也不会联动清理链接。"
+                    f"已忽略此监控项。请把「不删除目录」改成软链接目录下需要保护的子目录。"
+                )
+                continue
+            if self._is_excluded(link_dir):
+                logger.warn(
+                    f"软链接监控：软链接目录 {link_dir} 被「不删除目录」覆盖，"
+                    f"其下所有软链接都不会被清理；已忽略此监控项。"
+                )
+                continue
+            kept[src] = link_dir
+        return kept
+
     @staticmethod
     def _norm(p) -> str:
         return os.path.normcase(os.path.normpath(str(Path(p).expanduser())))
@@ -884,6 +913,27 @@ class SymlinkMonitor(_PluginBase):
                                         "label": "排除关键词（正则）",
                                         "rows": 2,
                                         "placeholder": "每一行一个正则，命中完整路径则忽略该文件",
+                                    },
+                                }],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [{
+                                    "component": "VAlert",
+                                    "props": {
+                                        "type": "warning",
+                                        "variant": "tonal",
+                                        "title": "「不删除目录」怎么填",
+                                        "text": "只填软链接目录下需要保护的子目录（如 /Movies3rd/Link3/珍藏）。"
+                                                "⚠️ 不要填监控目录本身或其父目录 —— 那样该目录下的文件"
+                                                "不会进入监控，删除也不会联动清理软链接。填错本插件会"
+                                                "直接忽略该监控项并在日志中告警。",
                                     },
                                 }],
                             },
