@@ -17,7 +17,7 @@
 在 MoviePilot 的「设置 → 插件市场」中追加本仓库地址：
 
 ```
-https://github.com/sanqianxingluo/moviepilot-plugins
+https://github.com/sanqianxingluo/MoviePilot-Plugins
 ```
 
 ### 方式二：本地插件仓库（推荐自用）

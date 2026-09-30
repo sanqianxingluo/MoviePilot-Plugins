@@ -60,7 +60,7 @@ MoviePilot 插件：**只监控，不建链**。盯着下载目录，发现文�
 MoviePilot「设置 → 插件市场」中追加：
 
 ```
-https://github.com/sanqianxingluo/moviepilot-plugins
+https://github.com/sanqianxingluo/MoviePilot-Plugins
 ```
 
 或在 `config/app.env` 的 `PLUGIN_MARKET` 里追加该地址（逗号分隔）。
