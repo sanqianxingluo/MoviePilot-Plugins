@@ -1,0 +1,16 @@
+{
+  "SymlinkMonitor": {
+    "name": "软链接监控",
+    "description": "监控下载目录并建立软链接；源文件删除后延迟联动清理软链接、刮削文件、转移记录与下载种子。",
+    "labels": "媒体库",
+    "version": "1.0.0",
+    "icon": "Linkace_C.png",
+    "author": "sanqianxingluo",
+    "level": 1,
+    "v2": true,
+    "v3": true,
+    "history": {
+      "v1.0.0": "首个版本：软链接监控、延迟删除、联动删种、刮削清理、转移记录清理、通知、立即运行、监控目录与不删除目录。"
+    }
+  }
+}
