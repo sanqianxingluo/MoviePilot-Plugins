@@ -101,7 +101,7 @@ class SymlinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkace_C.png"
     # 插件版本
-    plugin_version = "2.1.0"
+    plugin_version = "2.1.1"
     # 插件作者
     plugin_author = "sanqianxingluo"
     # 作者主页
@@ -504,12 +504,15 @@ class SymlinkMonitor(_PluginBase):
         if self._delete_torrents:
             self._delete_torrent(hash_str, src, links[0] if links else None)
 
-        # 5. 清理空目录（含只剩刮削文件的目录）；保护目录下的目录一律不动
+        # 5. 清理空目录（含只剩刮削文件的目录）；保护目录下的目录一律不动。
+        #    注意：源侧的「只剩刮削」清理也会删文件，因此同样受 clean_source_scrap
+        #    约束 —— 否则下载目录只读会被这条路径绕过。
         if self._clean_empty_dir:
             for p in list(links) + [src_path]:
                 if self._is_protected(p.parent):
                     continue
-                if self._delete_scrap:
+                is_source = (p == src_path)
+                if self._delete_scrap and (self._clean_source_scrap or not is_source):
                     self._purge_only_scrap_dirs(p.parent)
                 self._clean_empty_dirs(p.parent)
 
