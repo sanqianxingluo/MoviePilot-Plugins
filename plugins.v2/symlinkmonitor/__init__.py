@@ -47,6 +47,7 @@ app.core.event / app.schemas.types / app.db.transferhistory_oper）。
 实现可同时运行在 V2.x 与 V3 宿主上。
 """
 
+import json
 import os
 import re
 import shutil
@@ -93,6 +94,28 @@ _state_lock = threading.Lock()
 _queue_lock = threading.Lock()
 
 
+def _now_unique(entry: dict) -> str:
+    """生成一条记录的唯一键（时间 + 源路径 + 条目数）。"""
+    return "%s|%s|%s" % (entry.get("time", ""), entry.get("src", ""),
+                         entry.get("links", ""))
+
+
+def _shorten(path: str, limit: int = None) -> str:
+    """截断过长的路径，保留尾部（尾部信息量更大）。"""
+    limit = limit or DELETION_LOG_PATH_MAX
+    text = str(path)
+    if len(text) <= limit:
+        return text
+    return "…" + text[-(limit - 1):]
+
+# 删除记录：最多保留条数（超出丢弃最旧的）
+DELETION_LOG_LIMIT = 200
+# 详情页展示条数
+DELETION_LOG_SHOW = 20
+# 记录里的长路径截断长度
+DELETION_LOG_PATH_MAX = 110
+
+
 class SymlinkMonitor(_PluginBase):
     # 插件名称
     plugin_name = "软链接监控"
@@ -101,7 +124,7 @@ class SymlinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkace_C.png"
     # 插件版本
-    plugin_version = "2.1.1"
+    plugin_version = "2.2.1"
     # 插件作者
     plugin_author = "sanqianxingluo"
     # 作者主页
@@ -142,6 +165,12 @@ class SymlinkMonitor(_PluginBase):
     # 本次运行统计
     _stat = {"delete": 0, "link": 0, "sweep": 0, "fail": 0}
 
+    # ---- 删除记录（详情页可视化，落库持久化）----
+    _deletion_log: List[dict] = []
+    _deletion_log_ids: set = set()
+    _deletion_log_lock = threading.Lock()
+    _TMPLOG_KEY = "deletion_log"
+
     # ------------------------------------------------------------------ 配置
 
     def init_plugin(self, config: dict = None):
@@ -175,6 +204,8 @@ class SymlinkMonitor(_PluginBase):
                 self._delay_seconds = 30
 
         self._history = TransferHistoryOper()
+        # 读取历史删除记录（详情页可视化用）
+        self._load_deletion_log()
 
         # 解析「下载目录:软链接目录」
         for line in self._monitor_dirs.splitlines():
@@ -414,10 +445,12 @@ class SymlinkMonitor(_PluginBase):
         """全量清理一次：删除所有孤儿软链接，并重建快照。"""
         logger.info("软链接监控：开始全量清理孤儿链接")
         count = 0
+        swept: List[str] = []
         for link in self._orphan_links():
             try:
                 link.unlink()
                 count += 1
+                swept.append(str(link))
                 self._stat["sweep"] += 1
                 logger.info(f"软链接监控：已清理孤儿软链接 {link}")
                 if self._delete_scrap:
@@ -430,7 +463,108 @@ class SymlinkMonitor(_PluginBase):
         with _state_lock:
             self._snapshot = self._build_snapshot()
         logger.info(f"软链接监控：全量清理完成，共清理 {count} 个孤儿软链接")
+        if count:
+            self._append_deletion_log({
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "src": "（全量清理孤儿链接）",
+                "links": count,
+                "link_paths": [_shorten(x) for x in swept[:5]],
+                "scrap": 0,
+                "history": None,
+                "torrent": None,
+                "empty": self._clean_empty_dir,
+                "reason": "孤儿清理",
+            })
         return count
+
+    # -------------------------------------------------------------- 删除记录
+
+    def _load_deletion_log(self):
+        """从插件数据目录读取删除记录（容错：任何异常都退化为空表）。"""
+        try:
+            data = self.get_data(self._TMPLOG_KEY)
+            self._deletion_log = data if isinstance(data, list) else []
+        except Exception as e:
+            logger.warn(f"软链接监控：读取删除记录失败，按空处理：{e}")
+            self._deletion_log = []
+        self._deletion_log = [x for x in self._deletion_log if isinstance(x, dict)]
+        self._deletion_log_ids = {x.get("unique") for x in self._deletion_log if x.get("unique")}
+
+    def _append_deletion_log(self, entry: dict):
+        """追加一条删除记录并落库（超出上限丢最旧的）。"""
+        entry.setdefault("unique", _now_unique(entry))
+        with self._deletion_log_lock:
+            self._deletion_log.append(entry)
+            self._deletion_log_ids.add(entry["unique"])
+            if len(self._deletion_log) > DELETION_LOG_LIMIT:
+                drop = self._deletion_log[:-DELETION_LOG_LIMIT]
+                self._deletion_log = self._deletion_log[-DELETION_LOG_LIMIT:]
+                for d in drop:
+                    self._deletion_log_ids.discard(d.get("unique"))
+        self._flush_deletion_log(entry)
+
+    def _flush_deletion_log(self, new_entry: Optional[dict] = None):
+        """写入记录文件。优先增量 append，失败或不支持时整表覆盖。"""
+        try:
+            if new_entry is not None and self._append_json_line(new_entry):
+                return
+            with self._deletion_log_lock:
+                snapshot = list(self._deletion_log)
+            self.save_data(self._TMPLOG_KEY, snapshot)
+        except Exception as e:
+            logger.error(f"软链接监控：保存删除记录失败：{e}")
+
+    def _append_json_line(self, entry: dict) -> bool:
+        """把一条记录以 JSON 行追加到插件数据目录（避免整表重写）。"""
+        try:
+            path = Path(self.get_data_path()) / "deletion_log.jsonl"
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            return True
+        except Exception:
+            return False
+
+    def _tail_delete_log(self, limit: int = 20) -> List[dict]:
+        """读取删除记录，返回最新 limit 条（倒序）。"""
+        try:
+            path = Path(self.get_data_path()) / "deletion_log.jsonl"
+            if path.is_file():
+                rows = []
+                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(obj, dict):
+                        rows.append(obj)
+                if rows:
+                    rows.sort(key=lambda r: r.get("time", ""), reverse=True)
+                    return rows[:limit]
+        except Exception as e:
+            logger.warn(f"软链接监控：读取删除记录文件失败，回退数据库：{e}")
+        with self._deletion_log_lock:
+            rows = list(self._deletion_log)
+        rows.sort(key=lambda r: r.get("time", ""), reverse=True)
+        return rows[:limit]
+
+    def _clear_delete_log(self):
+        """清空删除记录。"""
+        with self._deletion_log_lock:
+            self._deletion_log = []
+            self._deletion_log_ids = set()
+        try:
+            path = Path(self.get_data_path()) / "deletion_log.jsonl"
+            if path.is_file():
+                path.unlink()
+        except Exception as e:
+            logger.warn(f"软链接监控：删除记录文件清理失败：{e}")
+        try:
+            self.save_data(self._TMPLOG_KEY, [])
+        except Exception as e:
+            logger.error(f"软链接监控：清空删除记录失败：{e}")
 
     # -------------------------------------------------------------- 延迟删除
 
@@ -493,11 +627,12 @@ class SymlinkMonitor(_PluginBase):
 
         # 2. 清理刮削文件：只清「软链接目录侧」的链接名对应刮削；
         #    下载目录（源）侧若受保护或未开启「清理下载目录刮削」，一律不动。
+        scrap_count = 0
         if self._delete_scrap:
             for link in links:
-                self._delete_scrap_files(link)
+                scrap_count += self._delete_scrap_files(link)
             if self._clean_source_scrap and not self._is_protected(src_path):
-                self._delete_scrap_files(src_path)
+                scrap_count += self._delete_scrap_files(src_path)
 
         # 3. 删除转移记录 + 4. 联动删除种子
         hash_str = self._delete_transfer_history(src)
@@ -507,17 +642,32 @@ class SymlinkMonitor(_PluginBase):
         # 5. 清理空目录（含只剩刮削文件的目录）；保护目录下的目录一律不动。
         #    注意：源侧的「只剩刮削」清理也会删文件，因此同样受 clean_source_scrap
         #    约束 —— 否则下载目录只读会被这条路径绕过。
+        empty_count = 0
         if self._clean_empty_dir:
             for p in list(links) + [src_path]:
                 if self._is_protected(p.parent):
                     continue
                 is_source = (p == src_path)
                 if self._delete_scrap and (self._clean_source_scrap or not is_source):
-                    self._purge_only_scrap_dirs(p.parent)
-                self._clean_empty_dirs(p.parent)
+                    # 这条路径删的是文件，计入刮削数（源侧未开开关时不执行）
+                    scrap_count += self._purge_only_scrap_dirs(p.parent)
+                empty_count += self._clean_empty_dirs(p.parent)
 
         self._stat["delete"] += 1
         self._stat["link"] += len(removed)
+        # 记录本次删除（详情页可视化）
+        self._append_deletion_log({
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "src": _shorten(src),
+            "links": len(removed),
+            "link_paths": [_shorten(x) for x in removed[:5]],
+            "scrap": scrap_count,
+            "empty_dirs": empty_count,
+            "history": (hash_str is not None) if self._delete_history else None,
+            "torrent": bool(hash_str) if self._delete_torrents else None,
+            "empty": self._clean_empty_dir,
+            "reason": "源文件删除",
+        })
         if self._notify:
             lines = [f"🗂️ 源文件：{src}"]
             if removed:
@@ -589,8 +739,8 @@ class SymlinkMonitor(_PluginBase):
         except Exception as e:
             logger.error(f"软链接监控：联动删除种子失败 {src}：{e}")
 
-    def _delete_scrap_files(self, path: Path):
-        """清理与 path 同名的刮削文件 / 刮削目录。
+    def _delete_scrap_files(self, path: Path) -> int:
+        """清理与 path 同名的刮削文件 / 刮削目录，返回删除条目数。
 
         匹配规则：条目名 == 媒体名，或为「媒体名 + -._ 分隔的附加部分」
         （如 movie-poster.jpg / movie.zh.srt / movie.trickplay），
@@ -598,11 +748,12 @@ class SymlinkMonitor(_PluginBase):
         """
         parent = path.parent
         if not parent.is_dir():
-            return
+            return 0
         prefix = path.name.rsplit(".", 1)[0] if "." in path.name else path.name
         if not prefix:
-            return
+            return 0
         pattern = re.compile(r"^%s([-._].*)?$" % re.escape(prefix))
+        deleted = 0
         try:
             for item in parent.iterdir():
                 if item == path:
@@ -617,14 +768,17 @@ class SymlinkMonitor(_PluginBase):
                     if item.is_dir() and not item.is_symlink():
                         if suffix in SCRAP_DIR_SUFFIXES:
                             shutil.rmtree(item, ignore_errors=True)
+                            deleted += 1
                             logger.info(f"软链接监控：已删除刮削目录 {item}")
                     elif suffix in SCRAP_EXTENSIONS:
                         item.unlink()
+                        deleted += 1
                         logger.info(f"软链接监控：已删除刮削文件 {item}")
                 except OSError as e:
                     logger.error(f"软链接监控：删除刮削文件 {item} 失败：{e}")
         except OSError as e:
             logger.error(f"软链接监控：遍历刮削文件失败 {parent}：{e}")
+        return deleted
 
     def _is_only_scrap(self, path: Path) -> bool:
         """目录内是否只剩刮削文件 / 刮削目录（说明媒体本体已不在）。"""
@@ -639,38 +793,44 @@ class SymlinkMonitor(_PluginBase):
             return False
         return True
 
-    def _purge_only_scrap_dirs(self, path: Optional[Path]):
-        """自下而上清理「只剩刮削文件」的目录，直到遇到根或保护目录。"""
+    def _purge_only_scrap_dirs(self, path: Optional[Path]) -> int:
+        """自下而上清理「只剩刮削文件」的目录，直到遇到根或保护目录。返回删除条目数。"""
+        deleted = 0
         while path is not None:
             if self._is_protected(path) or self._is_stop_dir(path) or not path.is_dir():
-                return
+                return deleted
             if not self._is_only_scrap(path):
-                return
+                return deleted
             try:
                 for item in list(path.iterdir()):
                     if item.is_dir() and not item.is_symlink():
                         shutil.rmtree(item, ignore_errors=True)
                     else:
                         item.unlink()
+                    deleted += 1
                     logger.info(f"软链接监控：已清理残留刮削 {item}")
             except OSError as e:
                 logger.error(f"软链接监控：清理残留刮削失败 {path}：{e}")
-                return
+                return deleted
             path = path.parent
+        return deleted
 
-    def _clean_empty_dirs(self, path: Optional[Path]):
-        """自下而上清理空目录，遇到收尾边界或保护目录停止。"""
+    def _clean_empty_dirs(self, path: Optional[Path]) -> int:
+        """自下而上清理空目录，遇到收尾边界或保护目录停止。返回删除目录数。"""
+        removed = 0
         while path is not None:
             if self._is_protected(path) or self._is_stop_dir(path) or not path.is_dir():
-                return
+                return removed
             try:
                 if any(path.iterdir()):
-                    return
+                    return removed
                 path.rmdir()
+                removed += 1
                 logger.info(f"软链接监控：已清理空目录 {path}")
             except OSError:
-                return
+                return removed
             path = path.parent
+        return removed
 
     # -------------------------------------------------------------- 工具方法
 
@@ -792,6 +952,22 @@ class SymlinkMonitor(_PluginBase):
                 "summary": "运行状态",
                 "description": "返回当前监控状态",
             },
+            {
+                "path": "/deletions",
+                "endpoint": self.api_deletions,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "最近删除记录",
+                "description": "返回最近 N 条软链接清理记录（默认 20 条）",
+            },
+            {
+                "path": "/clear_log",
+                "endpoint": self.api_clear_log,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "清空删除记录",
+                "description": "清空删除记录列表（不影响其它数据）",
+            },
         ]
 
     def api_run(self):
@@ -807,7 +983,21 @@ class SymlinkMonitor(_PluginBase):
             "link_dirs": [str(v) for v in self._dirconf.values()],
             "exclude_dirs": [x.strip() for x in self._exclude_dirs.splitlines() if x.strip()],
             "status": self.status_text(),
+            "deletion_log_count": len(self._deletion_log),
         }}
+
+    def api_deletions(self, limit: int = DELETION_LOG_SHOW):
+        """返回最近的删除记录。"""
+        try:
+            limit = max(1, min(DELETION_LOG_LIMIT, int(limit)))
+        except (TypeError, ValueError):
+            limit = DELETION_LOG_SHOW
+        return {"success": True, "data": self._tail_delete_log(limit)}
+
+    def api_clear_log(self):
+        """清空删除记录。"""
+        self._clear_delete_log()
+        return {"success": True, "message": "删除记录已清空"}
 
     def get_service(self) -> List[Dict[str, Any]]:
         """注册周期服务（插件重载后仍能继续清理到期的延迟任务）。"""
@@ -822,21 +1012,134 @@ class SymlinkMonitor(_PluginBase):
         }]
 
     def get_page(self) -> List[dict]:
-        """详情页。"""
-        return [{
-            "component": "VAlert",
+        """详情页：状态卡片 + 最近 20 条删除记录（表格可视化）。"""
+        rows = self._tail_delete_log(DELETION_LOG_SHOW)
+        return [
+            {
+                "component": "div",
+                "props": {"class": "pa-2"},
+                "content": [
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "class": "mb-3",
+                            "title": "🧹 软链接监控",
+                            "text": ("本插件不建立软链接，只做清理。\n"
+                                     "① 删除下载目录里的文件 → 清理软链接目录中指向它的软链接；\n"
+                                     "② 删除软链接目录里的链接 → 不会影响下载目录。\n"
+                                     "「保护目录」里的内容仍会被监控，但插件绝不删除它们。"),
+                        },
+                    },
+                    {
+                        "component": "VRow",
+                        "props": {"class": "mb-2"},
+                        "content": [
+                            self._stat_card("已删软链接", self._stat["link"], "mdi-link-variant-off", "primary"),
+                            self._stat_card("已处理批次", self._stat["delete"], "mdi-check-circle-outline", "success"),
+                            self._stat_card("孤儿清理", self._stat["sweep"], "mdi-broom", "info"),
+                            self._stat_card("失败", self._stat["fail"], "mdi-alert-circle-outline",
+                                            "error" if self._stat["fail"] else "secondary"),
+                        ],
+                    },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "secondary",
+                            "variant": "tonal",
+                            "density": "compact",
+                            "class": "mb-3",
+                            "text": self.status_text(),
+                        },
+                    },
+                    {
+                        "component": "div",
+                        "props": {"class": "text-subtitle-1 font-weight-bold mb-2"},
+                        "text": f"🗒️ 最近删除记录（最新 {DELETION_LOG_SHOW} 条 / 共 {len(self._deletion_log)} 条）",
+                    },
+                    self._build_log_table(rows),
+                ],
+            }
+        ]
+
+    def _build_log_table(self, rows: List[dict]) -> dict:
+        """把删除记录渲染成表格。"""
+        items = []
+        for r in rows:
+            links = r.get("links") or 0
+            scrap = r.get("scrap") or 0
+            dirs = r.get("empty_dirs") or 0
+            flags = []
+            if links:
+                flags.append(f"🔗软链{links}")
+            if scrap:
+                flags.append(f"🖼️刮削{scrap}")
+            if dirs:
+                flags.append(f"📁目录{dirs}")
+            if r.get("history"):
+                flags.append("📝记录")
+            if r.get("torrent"):
+                flags.append("🌱种子")
+            items.append({
+                "time": r.get("time", ""),
+                "reason": r.get("reason", "源文件删除"),
+                "links": links,
+                "scrap": scrap,
+                "dirs": dirs,
+                "src": r.get("src", ""),
+                "detail": " ".join(flags) if flags else "-",
+            })
+        if not items:
+            items = [{"time": "-", "reason": "暂无记录", "links": 0, "scrap": 0,
+                      "dirs": 0, "src": "插件尚未执行过清理，或记录已被清空", "detail": "-"}]
+        return {
+            "component": "VDataTableVirtual",
             "props": {
-                "type": "info",
-                "variant": "tonal",
-                "title": "🧹 软链接监控",
-                "text": ("本插件不建立软链接，只做清理。\n"
-                         "① 删除下载目录里的文件 → 清理软链接目录中指向它的软链接；\n"
-                         "② 删除软链接目录里的链接 → 不会影响下载目录。\n"
-                         "「保护目录」里的内容仍会被监控，但插件绝不删除它们。\n"
-                         "「立即运行一次」会全量清理一次孤儿链接。\n\n"
-                         + self.status_text()),
+                "class": "text-sm",
+                "headers": [
+                    {"title": "时间", "key": "time", "sortable": True, "width": "150px"},
+                    {"title": "类型", "key": "reason", "sortable": True, "width": "100px"},
+                    {"title": "软链", "key": "links", "sortable": True, "width": "64px"},
+                    {"title": "刮削", "key": "scrap", "sortable": True, "width": "64px"},
+                    {"title": "目录", "key": "dirs", "sortable": True, "width": "64px"},
+                    {"title": "源文件", "key": "src", "sortable": False},
+                    {"title": "联动", "key": "detail", "sortable": False, "width": "220px"},
+                ],
+                "items": items,
+                "height": "30rem",
+                "density": "compact",
+                "fixed-header": True,
+                "hover": True,
+                "no-data-text": "暂无删除记录",
             },
-        }]
+        }
+
+    @staticmethod
+    def _stat_card(title: str, value, icon: str, color: str) -> dict:
+        """统计小卡片。"""
+        return {
+            "component": "VCol",
+            "props": {"cols": 6, "md": 3},
+            "content": [{
+                "component": "VCard",
+                "props": {"variant": "tonal", "color": color, "class": "pa-2"},
+                "content": [{
+                    "component": "div",
+                    "props": {"class": "d-flex align-center"},
+                    "content": [
+                        {"component": "VIcon", "props": {"color": color, "class": "mr-2"}, "text": icon},
+                        {
+                            "component": "div",
+                            "content": [
+                                {"component": "div", "props": {"class": "text-caption"}, "text": title},
+                                {"component": "div", "props": {"class": "text-h6"}, "text": str(value)},
+                            ],
+                        },
+                    ],
+                }],
+            }],
+        }
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """配置页面。"""
