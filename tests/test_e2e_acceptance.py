@@ -102,6 +102,23 @@ time.sleep(6)
 time.sleep(12)
 check("方向一：删链接后下载目录原文件仍在", (SRC / "影片E.mkv").exists())
 
+# ---- 4b. 源目录只剩刮削时，源侧文件不应被删（v2.1.1 回归）----
+(SRC / "只剩刮削").mkdir()
+(SRC / "只剩刮削" / "裸片.mkv").write_text("N" * 10)
+(SRC / "只剩刮削" / "裸片.nfo").write_text("<nfo/>")
+(SRC / "只剩刮削" / "裸片-poster.jpg").write_text("img")
+(DST / "只剩刮削").mkdir()
+(DST / "只剩刮削" / "裸片.mkv").symlink_to(SRC / "只剩刮削" / "裸片.mkv")
+(DST / "只剩刮削" / "裸片.nfo").symlink_to(SRC / "只剩刮削" / "裸片.nfo")
+time.sleep(6)
+(SRC / "只剩刮削" / "裸片.mkv").unlink()      # 只剩 nfo + jpg
+time.sleep(18)
+check("源目录只剩刮削时未被清理（下载目录只读）",
+      (SRC / "只剩刮削" / "裸片.nfo").exists()
+      and (SRC / "只剩刮削" / "裸片-poster.jpg").exists())
+check("链接侧只剩刮削时被清理", not (DST / "只剩刮削" / "裸片.mkv").exists()
+      and not (DST / "只剩刮削" / "裸片.nfo").exists())
+
 # ---- 5. 真实文件与保护目录 ----
 (SRC / "影片F.mkv").write_text("F" * 10)
 (DST / "影片F.mkv").write_text("real-F")              # 同名真实文件
