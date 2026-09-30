@@ -19,6 +19,8 @@ import time
 from pathlib import Path
 
 from app.core.plugin import PluginManager
+from app.db.systemconfig_oper import SystemConfigOper
+from app.schemas.types import SystemConfigKey
 
 PID = "SymlinkMonitor"
 ROOT = Path("/config/_smtest")
@@ -26,6 +28,14 @@ SRC, DST = ROOT / "dl", ROOT / "lib"
 KEEP = DST / "珍藏"          # 保护目录：软链接目录下的子目录
 
 pm = PluginManager()
+
+# ⚠️ 铁律：本用例会经 PluginManager 改**线上真实配置**（save_plugin_config 写的是
+# systemconfig 表的 plugin.<PID>）。跑之前必须快照原配置、结束必须原样还原，
+# 否则收尾时写「空配置」会把用户配好的监控/保护目录冲掉（真实事故）。
+_original_cfg = pm.get_plugin_config(PID) or {}
+_original_state = pm.get_plugin_state(PID)
+_original_installed = SystemConfigOper().get(SystemConfigKey.UserInstalledPlugins) or []
+
 if ROOT.exists():
     shutil.rmtree(ROOT, ignore_errors=True)
 for d in (SRC, DST, KEEP):
@@ -164,21 +174,36 @@ pm.reload_plugin(PID)
 time.sleep(2)
 check("插件可停用", pm.get_plugin_state(PID) is False)
 
-# ---- 收尾：清理测试目录 + 恢复干净配置 ----
+# ---- 收尾：清理测试目录 + 还原用户原配置（绝不能写死默认值） ----
 shutil.rmtree(ROOT, ignore_errors=True)
 print("已清理测试目录:", not ROOT.exists())
 
-clean = {
-    "enabled": False, "notify": True, "onlyonce": False,
-    "monitor_dirs": "", "exclude_dirs": "", "exclude_keywords": "",
-    "scan_interval": 10, "delayed_deletion": True, "delay_seconds": 30,
-    "delete_scrap": True, "clean_source_scrap": False,
-    "delete_history": True, "delete_torrents": True, "clean_empty_dir": True,
-}
-pm.save_plugin_config(PID, clean, force=True)
+if _original_cfg:
+    pm.save_plugin_config(PID, _original_cfg, force=True)
+    print("已还原原配置:", json.dumps(_original_cfg, ensure_ascii=False)[:200])
+else:
+    # 原本就没有配置：删掉测试留下的配置键，而不是塞一份空配置
+    pm.delete_plugin_config(PID, force=True)
+    print("原本无配置，已删除测试留下的配置")
+
+# 还原启用状态与已装列表
+try:
+    if _original_state and not _original_cfg.get("enabled"):
+        # 原本启用但配置里 enabled=False 的矛盾情况，按状态回写
+        fixed = dict(_original_cfg)
+        fixed["enabled"] = True
+        pm.save_plugin_config(PID, fixed, force=True)
+except Exception as e:
+    print("还原启用状态跳过:", str(e)[:100])
+
+if _original_installed and PID in _original_installed:
+    SystemConfigOper().set(SystemConfigKey.UserInstalledPlugins, _original_installed)
+
 pm.reload_plugin(PID)
-print("最终配置:", json.dumps(pm.get_plugin_config(PID), ensure_ascii=False))
-print("最终状态 enabled =", pm.get_plugin_state(PID))
+time.sleep(1)
+_after = pm.get_plugin_config(PID) or {}
+print("还原后配置:", json.dumps(_after, ensure_ascii=False)[:200])
+print("配置已还原:", _after.get("monitor_dirs") == _original_cfg.get("monitor_dirs"))
 
 fails = [n for n, ok in results if not ok]
 print(f"\n合计 {len(results)} 项，失败 {len(fails)}" + ("" if not fails else "：" + ", ".join(fails)))
