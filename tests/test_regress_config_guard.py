@@ -1,12 +1,13 @@
-"""v2.0.1 回归测试：配置防呆 + 原有语义不回退。
+"""回归测试：保护目录语义 + 核心行为不回退。
 
-纯本地临时目录，不碰真实媒体库，也不碰数据库/下载器。
+对应 v2.1.0 的语义修正：把「不删除目录」从「不监控区」改成「保护区」——
+里面的内容照常监控、照常触发联动清理，只是插件绝不删除它们。
 
+纯本地临时目录，不碰真实媒体库/数据库/下载器。
 仅使用插件自身的扫描/清理逻辑，不启动线程、不需要启用插件。
 用法（容器内）: python3 test_regress_config_guard.py
 """
 import importlib
-import os
 import shutil
 from pathlib import Path
 
@@ -14,7 +15,8 @@ mod = importlib.import_module("app.plugins.symlinkmonitor")
 SymlinkMonitor = mod.SymlinkMonitor
 
 ROOT = Path("/config/_sm_regress")
-D, L, KEEP = ROOT / "Data3", ROOT / "Link3", ROOT / "Link3" / "珍藏"
+D, L = ROOT / "Data3", ROOT / "Link3"
+KEEP = L / "珍藏"
 results = []
 
 
@@ -23,62 +25,78 @@ def check(name, cond, extra=""):
     print(("  PASS " if cond else "  FAIL ") + name + (f" | {extra}" if extra else ""))
 
 
-def mk(exclude="", monitor=None):
-    """构造实例并把配置灌进去（init_plugin 会覆盖实例属性，故只能从 config 走）。"""
-    p = SymlinkMonitor()
-    p.init_plugin({
+def mk(exclude="", **over):
+    """实例属性只能经 init_plugin 的 config 传入（config 会覆盖属性）。"""
+    cfg = {
         "enabled": False, "notify": False, "onlyonce": False,
-        "monitor_dirs": monitor if monitor is not None else f"{D}:{L}",
-        "exclude_dirs": exclude, "exclude_keywords": "",
-        "scan_interval": 10,
-        # 关闭延迟删除，让删除立即执行（延迟逻辑另外单独测）
-        "delayed_deletion": False, "delay_seconds": 30,
-        "delete_scrap": True, "delete_history": False,
-        "delete_torrents": False, "clean_empty_dir": True,
-    })
+        "monitor_dirs": f"{D}:{L}", "exclude_dirs": exclude, "exclude_keywords": "",
+        "scan_interval": 10, "delayed_deletion": False, "delay_seconds": 30,
+        "delete_scrap": True, "clean_source_scrap": False,
+        "delete_history": False, "delete_torrents": False, "clean_empty_dir": True,
+    }
+    cfg.update(over)
+    p = SymlinkMonitor()
+    p.init_plugin(cfg)
     p._history = None
     p._stat = {"delete": 0, "link": 0, "sweep": 0, "fail": 0}
     return p
 
 
-shutil.rmtree(ROOT, ignore_errors=True)
-D.mkdir(parents=True)
-L.mkdir(parents=True)
-KEEP.mkdir(parents=True)
+def scene():
+    shutil.rmtree(ROOT, ignore_errors=True)
+    D.mkdir(parents=True)
+    L.mkdir(parents=True)
+    KEEP.mkdir(parents=True)
 
-print("=== 1. 防呆：历史配置里已把 Data3 填进「不删除目录」 ===")
-p = mk(exclude=str(D))
-check("被覆盖的监控项被剔除（dirconf 为空）", p._dirconf == {}, f"dirconf={p._dirconf}")
 
-print("\n=== 2. 防呆：软链接目录被覆盖，同样剔除 ===")
-p = mk(exclude=str(L))
-check("软链接目录被覆盖时剔除该监控项", p._dirconf == {}, f"dirconf={p._dirconf}")
+scene()
 
-print("\n=== 3. 正确用法：只保护 Link3 下的子目录 ===")
+print("=== 1. 保护目录不再等于「不监控」 ===")
+(D / "片子Z.mkv").write_text("x")
+(L / "片子Z.mkv").symlink_to(D / "片子Z.mkv")
+p = mk(exclude=str(D))          # 故意把下载目录填进保护目录
+p._snapshot = p._build_snapshot()
+check("被保护的下载目录文件仍进快照（不再静默失灵）",
+      len(p._snapshot) == 1, f"{len(p._snapshot)} 项")
+(D / "片子Z.mkv").unlink()
+p._scan_once()
+p._flush_deletion_queue()
+check("删除仍被检测到", p._stat["delete"] > 0, f"_stat={p._stat}")
+check("软链接仍被清理", not (L / "片子Z.mkv").is_symlink())
+
+print("\n=== 2. 保护 Link3 子目录：真保护 ===")
+scene()
+(D / "珍藏片.mkv").write_text("x")
+(KEEP / "珍藏片.mkv").symlink_to(D / "珍藏片.mkv")
 p = mk(exclude=str(KEEP))
 check("监控项保留", list(p._dirconf.keys()) == [str(D)], f"dirconf={p._dirconf}")
-check("子目录保护仍生效", p._is_excluded(KEEP / "某片.mkv"))
-check("下载目录本身不被排除", not p._is_excluded(D / "某片.mkv"))
+check("子目录被识别为保护", p._is_protected(KEEP / "某片.mkv"))
+check("下载目录不受保护", not p._is_protected(D / "某片.mkv"))
+p._snapshot = p._build_snapshot()
+(D / "珍藏片.mkv").unlink()
+p._scan_once()
+p._flush_deletion_queue()
+check("删除被检测到", p._stat["delete"] > 0, f"_stat={p._stat}")
+check("保护目录里的链接未被删", (KEEP / "珍藏片.mkv").is_symlink())
 
-print("\n=== 4. 语义未回退：删除 → 联动清链（不删除目录为空）===")
-for f in ("片子Z.mkv", "片子Z.nfo"):
+print("\n=== 3. 语义未回退：删除 → 联动清链 ===")
+scene()
+for f in ("片子A.mkv", "片子A.nfo"):
     (D / f).write_text("x")
     (L / f).symlink_to(D / f)
 p = mk(exclude="")
 p._snapshot = p._build_snapshot()
 check("快照含 2 个文件", len(p._snapshot) == 2, f"{len(p._snapshot)}")
-(D / "片子Z.mkv").unlink()
-(D / "片子Z.nfo").unlink()
+(D / "片子A.mkv").unlink()
+(D / "片子A.nfo").unlink()
 p._scan_once()
 p._flush_deletion_queue()
 check("检测到删除", p._stat["delete"] > 0, f"_stat={p._stat}")
-check("软链接被清理", not (L / "片子Z.mkv").is_symlink())
-check("链接侧刮削链被清理", not (L / "片子Z.nfo").exists())
+check("软链接被清理", not (L / "片子A.mkv").is_symlink())
+check("链接侧刮削链被清理", not (L / "片子A.nfo").exists())
 
-print("\n=== 5. 语义未回退：不建链 ===")
-shutil.rmtree(ROOT, ignore_errors=True)
-D.mkdir(parents=True)
-L.mkdir(parents=True)
+print("\n=== 4. 语义未回退：不建链 ===")
+scene()
 p = mk(exclude="")
 (D / "新片.mkv").write_text("x")
 p._snapshot = p._build_snapshot()
@@ -86,7 +104,7 @@ p._scan_once()
 check("新增文件后 Link3 无软链接", not (L / "新片.mkv").exists())
 check("源文件本体在", (D / "新片.mkv").exists())
 
-print("\n=== 6. 配置页告警存在 ===")
+print("\n=== 5. 配置页结构完整 ===")
 form, model = SymlinkMonitor().get_form()
 flat = []
 
@@ -99,12 +117,12 @@ def walk(nodes):
 
 
 walk(form)
-warns = [n for n in flat if n.get("component") == "VAlert"
-         and n.get("props", {}).get("type") == "warning"]
-check("存在 warning 级告警提示", len(warns) >= 1, f"{len(warns)} 条")
-if warns:
-    txt = warns[0]["props"].get("text", "")
-    check("告警文案点明不要填监控目录", "不要填监控目录" in txt or "监控目录本身" in txt)
+models = [n["props"]["model"] for n in flat if n.get("props", {}).get("model")]
+missing = [k for k in model if k not in models]
+check("默认模型字段都有对应表单项", missing == [], f"缺失={missing}")
+check("无重复字段", len(models) == len(set(models)), f"{len(models)}/{len(set(models))}")
+alerts = [n for n in flat if n.get("component") == "VAlert"]
+check("配置页有说明提示", len(alerts) >= 1, f"{len(alerts)} 条")
 
 shutil.rmtree(ROOT, ignore_errors=True)
 print("\n测试目录已清理:", not ROOT.exists())

@@ -17,20 +17,26 @@ MoviePilot 软链接清理插件 (SymlinkMonitor)
 
 安全约束：
   · 只删除「软链接」本身，绝不删除软链接目录里的真实文件；
-  · 只删除指向监控目录的软链接，不碰无关链接；
-  · 「不删除目录」下的内容一律不动（不监控、不删链接）。
+  · 默认**不删除下载目录里的任何文件**（刮削清理仅作用于软链接目录侧）；
+  · 「保护目录」（不删除目录）里的内容照常监控，但插件绝不删除它们；
+  · 只删除指向监控目录的软链接，不碰无关链接。
+
+双向行为：
+  · 删下载目录 → 同步清理软链接目录里指向它的软链接（主功能）
+  · 删软链接目录 → **不会**影响下载目录
 
 配置项：
   enabled            启用插件
   notify             发送通知
   onlyonce           立即运行一次（全量清理孤儿链接）
   monitor_dirs       监控目录，每行一条：「下载目录:软链接目录」
-  exclude_dirs       不删除目录，每行一条；这些目录下的内容永不删除
+  exclude_dirs       保护目录（不删除目录），每行一条；内容仍监控，但绝不删除
   exclude_keywords   排除关键词，每行一条，命中则忽略
   scan_interval      扫描间隔（秒）
   delayed_deletion   启用延迟删除
   delay_seconds      延迟删除时间（秒）
-  delete_scrap       联动清理刮削文件
+  delete_scrap       清理软链接目录里的刮削链接/文件
+  clean_source_scrap 是否也清理下载目录里的刮削文件（默认关，保护源数据）
   delete_history     联动删除转移记录
   delete_torrents    联动删除下载种子
   clean_empty_dir    联动清理空目录
@@ -91,11 +97,11 @@ class SymlinkMonitor(_PluginBase):
     # 插件名称
     plugin_name = "软链接监控"
     # 插件描述
-    plugin_desc = "监控下载目录，文件删除后延迟清理软链接目录中指向它的软链接，并联动清理刮削文件、转移记录与下载种子。"
+    plugin_desc = "监控下载目录，文件删除后延迟清理软链接目录中指向它的软链接，并联动清理刮削链接、转移记录与下载种子；保护目录里的内容永不删除。"
     # 插件图标
     plugin_icon = "Linkace_C.png"
     # 插件版本
-    plugin_version = "2.0.1"
+    plugin_version = "2.1.0"
     # 插件作者
     plugin_author = "sanqianxingluo"
     # 作者主页
@@ -118,6 +124,7 @@ class SymlinkMonitor(_PluginBase):
     _delayed_deletion = True
     _delay_seconds = 30
     _delete_scrap = True
+    _clean_source_scrap = False
     _delete_history = True
     _delete_torrents = True
     _clean_empty_dir = True
@@ -154,6 +161,7 @@ class SymlinkMonitor(_PluginBase):
             self._exclude_keywords = config.get("exclude_keywords") or ""
             self._delayed_deletion = bool(config.get("delayed_deletion", True))
             self._delete_scrap = bool(config.get("delete_scrap", True))
+            self._clean_source_scrap = bool(config.get("clean_source_scrap", False))
             self._delete_history = bool(config.get("delete_history", True))
             self._delete_torrents = bool(config.get("delete_torrents", True))
             self._clean_empty_dir = bool(config.get("clean_empty_dir", True))
@@ -223,6 +231,7 @@ class SymlinkMonitor(_PluginBase):
             "delayed_deletion": self._delayed_deletion,
             "delay_seconds": self._delay_seconds,
             "delete_scrap": self._delete_scrap,
+            "clean_source_scrap": self._clean_source_scrap,
             "delete_history": self._delete_history,
             "delete_torrents": self._delete_torrents,
             "clean_empty_dir": self._clean_empty_dir,
@@ -281,7 +290,11 @@ class SymlinkMonitor(_PluginBase):
         return snap
 
     def _skip_file(self, path: Path, key: str = None) -> bool:
-        """判断文件是否应跳过（临时 / 隐藏 / 回收站 / 排除关键词 / 不删除目录）。"""
+        """判断文件是否应跳过（临时 / 隐藏 / 回收站 / 排除关键词）。
+
+        注意：「不删除目录」是**保护目录**——里面的文件照常监控（照常建快照、
+        照常触发联动清理），只是插件绝不会删除它们。因此这里不做排除。
+        """
         key = key or str(path)
         if path.suffix.lower() in TMP_SUFFIXES:
             return True
@@ -289,8 +302,6 @@ class SymlinkMonitor(_PluginBase):
             if seg in key:
                 return True
         if any(part.startswith(".") for part in path.parts):
-            return True
-        if self._is_excluded(path):
             return True
         if self._exclude_keywords:
             for kw in self._exclude_keywords.splitlines():
@@ -393,7 +404,8 @@ class SymlinkMonitor(_PluginBase):
                 # 只处理指向监控目录的断链
                 if not self._is_same_or_child(target, mon):
                     continue
-                if self._is_excluded(entry) or self._is_excluded(target):
+                # 保护目录里的链接不动
+                if self._is_protected(entry):
                     continue
                 orphans.append(entry)
         return orphans
@@ -424,9 +436,6 @@ class SymlinkMonitor(_PluginBase):
 
     def _enqueue_deletion(self, src: str):
         """把删除事件放入延迟队列。"""
-        if self._is_excluded(Path(src)):
-            logger.info(f"软链接监控：{src} 在不删除目录中，忽略删除")
-            return
         if not self._delayed_deletion:
             self._execute_deletion(src)
             return
@@ -465,10 +474,10 @@ class SymlinkMonitor(_PluginBase):
         removed: List[str] = []
         links = self._find_links(src)
 
-        # 1. 删除指向该源文件的软链接
+        # 1. 删除指向该源文件的软链接（链接位于保护目录则跳过）
         for link in links:
-            if self._is_excluded(link):
-                logger.info(f"软链接监控：{link} 在不删除目录中，跳过")
+            if self._is_protected(link):
+                logger.info(f"软链接监控：{link} 在保护目录中，跳过")
                 continue
             if not link.is_symlink():
                 # 安全兜底：软链接目录中的真实文件一律不动
@@ -482,20 +491,24 @@ class SymlinkMonitor(_PluginBase):
                 self._stat["fail"] += 1
                 logger.error(f"软链接监控：删除软链接 {link} 失败：{e}")
 
-        # 2. 清理刮削文件（软链接目录侧 + 下载目录侧的同名残留）
+        # 2. 清理刮削文件：只清「软链接目录侧」的链接名对应刮削；
+        #    下载目录（源）侧若受保护或未开启「清理下载目录刮削」，一律不动。
         if self._delete_scrap:
             for link in links:
                 self._delete_scrap_files(link)
-            self._delete_scrap_files(src_path)
+            if self._clean_source_scrap and not self._is_protected(src_path):
+                self._delete_scrap_files(src_path)
 
         # 3. 删除转移记录 + 4. 联动删除种子
         hash_str = self._delete_transfer_history(src)
         if self._delete_torrents:
             self._delete_torrent(hash_str, src, links[0] if links else None)
 
-        # 5. 清理空目录（含只剩刮削文件的目录）
+        # 5. 清理空目录（含只剩刮削文件的目录）；保护目录下的目录一律不动
         if self._clean_empty_dir:
             for p in list(links) + [src_path]:
+                if self._is_protected(p.parent):
+                    continue
                 if self._delete_scrap:
                     self._purge_only_scrap_dirs(p.parent)
                 self._clean_empty_dirs(p.parent)
@@ -624,9 +637,9 @@ class SymlinkMonitor(_PluginBase):
         return True
 
     def _purge_only_scrap_dirs(self, path: Optional[Path]):
-        """自下而上清理「只剩刮削文件」的目录，直到遇到根或不删除目录。"""
+        """自下而上清理「只剩刮削文件」的目录，直到遇到根或保护目录。"""
         while path is not None:
-            if self._is_excluded(path) or self._is_stop_dir(path) or not path.is_dir():
+            if self._is_protected(path) or self._is_stop_dir(path) or not path.is_dir():
                 return
             if not self._is_only_scrap(path):
                 return
@@ -643,9 +656,9 @@ class SymlinkMonitor(_PluginBase):
             path = path.parent
 
     def _clean_empty_dirs(self, path: Optional[Path]):
-        """自下而上清理空目录，遇到收尾边界或不删除目录停止。"""
+        """自下而上清理空目录，遇到收尾边界或保护目录停止。"""
         while path is not None:
-            if self._is_excluded(path) or self._is_stop_dir(path) or not path.is_dir():
+            if self._is_protected(path) or self._is_stop_dir(path) or not path.is_dir():
                 return
             try:
                 if any(path.iterdir()):
@@ -678,29 +691,19 @@ class SymlinkMonitor(_PluginBase):
         return any(key == str(v) for v in self._dirconf.values())
 
     def _drop_self_excluded(self, dirconf: Dict[str, Path]) -> Dict[str, Path]:
-        """剔除被「不删除目录」覆盖的监控目录，并对剩余项剔除被覆盖的软链接目录。
+        """保留占位：保护目录不再影响监控，故无需剔除任何监控项。
 
-        「不删除目录」的意义是「不删这里的文件」，把监控目录放进去会让该区域的
-        文件永远不进快照、删除事件彻底失灵，且孤儿清理也会一并跳过。这里直接
-        拦下并给出明确告警，避免静默失效。
+        历史背景：早期实现把「不删除目录」当作「不监控目录」，导致把监控目录
+        填进去时删除事件静默失灵。现已改为「保护目录」语义——照常监控、只是不删，
+        因此这里只做存在性告警。
         """
-        kept: Dict[str, Path] = {}
         for src, link_dir in dirconf.items():
-            if self._is_excluded(src):
-                logger.error(
-                    f"软链接监控：监控目录 {src} 被「不删除目录」覆盖 —— "
-                    f"该目录下的文件不会被监控，删除也不会联动清理链接。"
-                    f"已忽略此监控项。请把「不删除目录」改成软链接目录下需要保护的子目录。"
+            if self._is_protected(src):
+                logger.info(
+                    f"软链接监控：下载目录 {src} 位于保护目录中 —— 仍会照常监控，"
+                    f"但本插件不会删除其中的任何文件。"
                 )
-                continue
-            if self._is_excluded(link_dir):
-                logger.warn(
-                    f"软链接监控：软链接目录 {link_dir} 被「不删除目录」覆盖，"
-                    f"其下所有软链接都不会被清理；已忽略此监控项。"
-                )
-                continue
-            kept[src] = link_dir
-        return kept
+        return dirconf
 
     @staticmethod
     def _norm(p) -> str:
@@ -717,7 +720,7 @@ class SymlinkMonitor(_PluginBase):
             return False
 
     def _is_excluded(self, path) -> bool:
-        """是否命中「不删除目录」。"""
+        """路径是否位于某个「保护目录 / 不删除目录」之下。"""
         if not self._exclude_dirs:
             return False
         for line in self._exclude_dirs.splitlines():
@@ -725,6 +728,10 @@ class SymlinkMonitor(_PluginBase):
             if line and self._is_same_or_child(path, line):
                 return True
         return False
+
+    def _is_protected(self, path) -> bool:
+        """路径是否受保护（插件绝不删除它）。等价于 _is_excluded，保留语义化名称。"""
+        return self._is_excluded(path)
 
     def status_text(self) -> str:
         """运行状态描述。"""
@@ -819,9 +826,10 @@ class SymlinkMonitor(_PluginBase):
                 "type": "info",
                 "variant": "tonal",
                 "title": "🧹 软链接监控",
-                "text": ("本插件不建立软链接，只做清理：下载目录中的文件被删除后，"
-                         "延迟确认为真删除，再删掉软链接目录中指向它的软链接，"
-                         "并联动清理刮削文件、转移记录、下载种子与空目录。\n\n"
+                "text": ("本插件不建立软链接，只做清理。\n"
+                         "① 删除下载目录里的文件 → 清理软链接目录中指向它的软链接；\n"
+                         "② 删除软链接目录里的链接 → 不会影响下载目录。\n"
+                         "「保护目录」里的内容仍会被监控，但插件绝不删除它们。\n"
                          "「立即运行一次」会全量清理一次孤儿链接。\n\n"
                          + self.status_text()),
             },
@@ -845,9 +853,15 @@ class SymlinkMonitor(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            self._switch("delete_scrap", "清理刮削文件", 12, 3),
+                            self._switch("delete_scrap", "清理软链接目录刮削", 12, 3),
+                            self._switch("clean_source_scrap", "清理下载目录刮削", 12, 3),
                             self._switch("delete_history", "删除转移记录", 12, 3),
                             self._switch("delete_torrents", "联动删除种子", 12, 3),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             self._switch("clean_empty_dir", "清理空目录", 12, 3),
                         ],
                     },
@@ -872,8 +886,7 @@ class SymlinkMonitor(_PluginBase):
                                         "label": "监控目录（下载目录:软链接目录）",
                                         "rows": 5,
                                         "placeholder": "每一行一条，例如：\n"
-                                                       "/downloads/电影:/media/电影\n"
-                                                       "/downloads/剧集:/media/剧集\n\n"
+                                                       "/Movies3rd/Data3:/Movies3rd/Link3\n\n"
                                                        "下载目录中的文件被删除后，"
                                                        "会删除软链接目录中指向它的软链接。",
                                     },
@@ -891,10 +904,11 @@ class SymlinkMonitor(_PluginBase):
                                     "component": "VTextarea",
                                     "props": {
                                         "model": "exclude_dirs",
-                                        "label": "不删除目录",
+                                        "label": "保护目录（不删除目录）",
                                         "rows": 3,
-                                        "placeholder": "每一行一个目录；这些目录下的内容永不删除，也不监控\n"
-                                                       "（含其子目录）",
+                                        "placeholder": "每一行一个目录；这些目录里的内容仍会被监控，"
+                                                       "但本插件绝不会删除它们\n"
+                                                       "例如：/Movies3rd/Link3/珍藏",
                                     },
                                 }],
                             },
@@ -927,13 +941,12 @@ class SymlinkMonitor(_PluginBase):
                                 "content": [{
                                     "component": "VAlert",
                                     "props": {
-                                        "type": "warning",
+                                        "type": "info",
                                         "variant": "tonal",
-                                        "title": "「不删除目录」怎么填",
-                                        "text": "只填软链接目录下需要保护的子目录（如 /Movies3rd/Link3/珍藏）。"
-                                                "⚠️ 不要填监控目录本身或其父目录 —— 那样该目录下的文件"
-                                                "不会进入监控，删除也不会联动清理软链接。填错本插件会"
-                                                "直接忽略该监控项并在日志中告警。",
+                                        "title": "两个方向的行为",
+                                        "text": "① 删除下载目录里的文件 → 清理软链接目录里指向它的软链接；"
+                                                "② 删除软链接目录里的链接 → 不会影响下载目录。\n"
+                                                "「保护目录」里的内容仍会被监控，但插件绝不删除它们。",
                                     },
                                 }],
                             },
@@ -971,6 +984,7 @@ class SymlinkMonitor(_PluginBase):
             "delayed_deletion": True,
             "delay_seconds": 30,
             "delete_scrap": True,
+            "clean_source_scrap": False,
             "delete_history": True,
             "delete_torrents": True,
             "clean_empty_dir": True,

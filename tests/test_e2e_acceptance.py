@@ -1,13 +1,13 @@
 """端到端验收测试（在 MoviePilot 容器内运行）。
 
-验证「只监控删除、绝不建链」的语义：
+验证「只监控删除、绝不建链」+「保护目录」语义：
   1. 启动后不改动已有软链接，也不为缺链的文件补链
   2. 下载目录新增文件 → **不建立任何软链接**（核心需求）
   3. 下载目录删除文件 → 延迟窗口内链还在 → 延迟后链被删除
-  4. 刮削文件（链接侧 + 下载侧）联动清理
+  4. 方向一：删软链接目录里的链接 → 不波及下载目录（源只读）
   5. 空目录联动清理
   6. 软链接目录中的**真实文件**永不删除（安全底线）
-  7. 「不删除目录」下的链不删
+  7. 「保护目录」里的链接不删，但其中的文件照常被监控
   8. 「立即运行一次」= 立刻清掉孤儿断链（不等延迟）
   9. API 注册 / 启用 / 停用
 
@@ -22,7 +22,8 @@ from app.core.plugin import PluginManager
 
 PID = "SymlinkMonitor"
 ROOT = Path("/config/_smtest")
-SRC, DST, KEEP = ROOT / "dl", ROOT / "lib", ROOT / "keep"
+SRC, DST = ROOT / "dl", ROOT / "lib"
+KEEP = DST / "珍藏"          # 保护目录：软链接目录下的子目录
 
 pm = PluginManager()
 if ROOT.exists():
@@ -33,14 +34,16 @@ for d in (SRC, DST, KEEP):
 # ---- 前置：模拟「别的工具已经建好的软链接」 ----
 (SRC / "影片A.mkv").write_text("A" * 10)
 (SRC / "影片A.nfo").write_text("<nfo/>")
+(SRC / "影片A-poster.jpg").write_text("img")
 (SRC / "影片B.mkv").write_text("B" * 10)
-(SRC / "影片C.mkv").write_text("C" * 10)            # 故意没有链
-(KEEP / "影片K.mkv").write_text("K" * 10)
+(SRC / "影片C.mkv").write_text("C" * 10)             # 故意没有链
+(SRC / "影片K.mkv").write_text("K" * 10)
 (DST / "影片A.mkv").symlink_to(SRC / "影片A.mkv")
 (DST / "影片A.nfo").symlink_to(SRC / "影片A.nfo")
+(DST / "影片A-poster.jpg").symlink_to(SRC / "影片A-poster.jpg")
 (DST / "影片B.mkv").symlink_to(SRC / "影片B.mkv")
-(DST / "真实文件.mkv").write_text("real")            # 真实文件，绝不能删
-(DST / "影片K.mkv").symlink_to(KEEP / "影片K.mkv")   # 指向不删除目录
+(DST / "真实文件.mkv").write_text("real")             # 真实文件，绝不能删
+(KEEP / "影片K.mkv").symlink_to(SRC / "影片K.mkv")    # 位于保护目录中的链接
 
 cfg = {
     "enabled": True, "notify": False, "onlyonce": False,
@@ -48,8 +51,8 @@ cfg = {
     "exclude_dirs": str(KEEP),
     "exclude_keywords": "",
     "scan_interval": 3, "delayed_deletion": True, "delay_seconds": 5,
-    "delete_scrap": True, "delete_history": False,
-    "delete_torrents": False, "clean_empty_dir": True,
+    "delete_scrap": True, "clean_source_scrap": False,
+    "delete_history": False, "delete_torrents": False, "clean_empty_dir": True,
 }
 pm.save_plugin_config(PID, cfg, force=True)
 pm.reload_plugin(PID)
@@ -87,19 +90,30 @@ time.sleep(16)
 check("源文件删除后软链接被删除",
       not (DST / "影片A.mkv").is_symlink() and not (DST / "影片A.mkv").exists())
 check("链接侧的刮削链被清理", not (DST / "影片A.nfo").exists())
-check("下载侧的残留刮削被清理", not (SRC / "影片A.nfo").exists())
+check("下载目录默认只读：源侧刮削未被删", (SRC / "影片A.nfo").exists()
+      and (SRC / "影片A-poster.jpg").exists())
 check("无关链接不受影响（影片B）", (DST / "影片B.mkv").is_symlink())
 
-# ---- 4. 真实文件与不删除目录保护 ----
+# ---- 4. 方向一：删软链接目录里的链接 → 不波及下载目录 ----
+(SRC / "影片E.mkv").write_text("E" * 10)
+(DST / "影片E.mkv").symlink_to(SRC / "影片E.mkv")
+time.sleep(6)
+(DST / "影片E.mkv").unlink()          # 手动删掉链接
+time.sleep(12)
+check("方向一：删链接后下载目录原文件仍在", (SRC / "影片E.mkv").exists())
+
+# ---- 5. 真实文件与保护目录 ----
 (SRC / "影片F.mkv").write_text("F" * 10)
-(DST / "影片F.mkv").write_text("real-F")             # 同名真实文件
-(KEEP / "影片K.mkv").unlink()
-time.sleep(18)
+(DST / "影片F.mkv").write_text("real-F")              # 同名真实文件
+time.sleep(12)
 check("软链接目录中的同名真实文件未被删除（安全底线）",
       (DST / "影片F.mkv").exists() and not (DST / "影片F.mkv").is_symlink())
-check("不删除目录内的链接未被清理", (DST / "影片K.mkv").is_symlink())
 
-# ---- 5. 空目录联动清理 ----
+(SRC / "影片K.mkv").unlink()          # 删除保护目录中链接的源文件
+time.sleep(16)
+check("保护目录里的链接未被清理（真保护）", (KEEP / "影片K.mkv").is_symlink())
+
+# ---- 6. 空目录联动清理 ----
 (SRC / "子目录").mkdir()
 (SRC / "子目录" / "影片H.mkv").write_text("H" * 10)
 (DST / "子目录").mkdir()
@@ -110,7 +124,7 @@ time.sleep(18)
 check("空目录被联动清理（下载侧）", not (SRC / "子目录").exists())
 check("空目录被联动清理（链接侧）", not (DST / "子目录").exists())
 
-# ---- 6. 立即运行一次：孤儿断链秒清 ----
+# ---- 7. 立即运行一次：孤儿断链秒清 ----
 (SRC / "影片G.mkv").write_text("G" * 10)
 (DST / "影片G.mkv").symlink_to(SRC / "影片G.mkv")
 time.sleep(6)
@@ -120,13 +134,13 @@ check("「立即运行一次」立刻清掉孤儿断链（不等延迟）",
       not (DST / "影片G.mkv").exists() and not (DST / "影片G.mkv").is_symlink(),
       f"sync_all 清理 {n} 个")
 
-# ---- 7. API 注册 ----
+# ---- 8. API 注册 ----
 apis = [a["path"] for a in pm.get_plugin_apis(PID)]
 check("「立即运行一次」API 已注册", any(p.endswith("/run") for p in apis), str(apis))
 check("状态 API 已注册", any(p.endswith("/status") for p in apis))
 check("详情页可用", bool(obj and obj.get_page()))
 
-# ---- 8. 停用 ----
+# ---- 9. 停用 ----
 cfg["enabled"] = False
 pm.save_plugin_config(PID, cfg, force=True)
 pm.reload_plugin(PID)
@@ -141,8 +155,8 @@ clean = {
     "enabled": False, "notify": True, "onlyonce": False,
     "monitor_dirs": "", "exclude_dirs": "", "exclude_keywords": "",
     "scan_interval": 10, "delayed_deletion": True, "delay_seconds": 30,
-    "delete_scrap": True, "delete_history": True, "delete_torrents": True,
-    "clean_empty_dir": True,
+    "delete_scrap": True, "clean_source_scrap": False,
+    "delete_history": True, "delete_torrents": True, "clean_empty_dir": True,
 }
 pm.save_plugin_config(PID, clean, force=True)
 pm.reload_plugin(PID)

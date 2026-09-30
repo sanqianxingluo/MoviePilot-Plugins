@@ -62,7 +62,8 @@ try:
     true("正常文件不跳过", not p2._skip_file(tmp / "movie.mkv"))
     true("回收站跳过", p2._skip_file(Path("/x/@eaDir/y.mkv")))
     p2._exclude_dirs = "/media/keep"
-    true("不删除目录跳过", p2._skip_file(Path("/media/keep/a.mkv")))
+    true("保护目录不再跳过（照常监控）", not p2._skip_file(Path("/media/keep/a.mkv")))
+    true("但被标记为受保护", p2._is_protected(Path("/media/keep/a.mkv")))
     p2._exclude_keywords = r"^(?:(?!$).)*$"
     true("正则元字符不炸", isinstance(p2._skip_file(tmp / "movie.mkv"), bool))
 
