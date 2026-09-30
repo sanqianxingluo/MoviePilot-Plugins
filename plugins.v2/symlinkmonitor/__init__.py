@@ -124,7 +124,7 @@ class SymlinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkace_C.png"
     # 插件版本
-    plugin_version = "2.2.1"
+    plugin_version = "2.2.2"
     # 插件作者
     plugin_author = "sanqianxingluo"
     # 作者主页
@@ -478,93 +478,111 @@ class SymlinkMonitor(_PluginBase):
         return count
 
     # -------------------------------------------------------------- 删除记录
+    #
+    # 单一事实源 = 插件数据目录里的 deletion_log.jsonl（追加写、跨重启保留）。
+    # 内存里只缓存一份只读快照，任何对外输出（详情页 / API / 计数）都走同一个
+    # _tail_delete_log()，避免「列表读文件、计数读内存」两边不一致。
+
+    def _log_path(self) -> Path:
+        """删除记录文件路径。"""
+        return Path(self.get_data_path()) / "deletion_log.jsonl"
 
     def _load_deletion_log(self):
-        """从插件数据目录读取删除记录（容错：任何异常都退化为空表）。"""
-        try:
-            data = self.get_data(self._TMPLOG_KEY)
-            self._deletion_log = data if isinstance(data, list) else []
-        except Exception as e:
-            logger.warn(f"软链接监控：读取删除记录失败，按空处理：{e}")
-            self._deletion_log = []
-        self._deletion_log = [x for x in self._deletion_log if isinstance(x, dict)]
+        """载入记录（把文件读进内存缓存），并顺带裁到上限。"""
+        self._deletion_log = self._read_log()
+        if len(self._deletion_log) > DELETION_LOG_LIMIT:
+            self._deletion_log = self._deletion_log[-DELETION_LOG_LIMIT:]
+            self._rewrite_log()
         self._deletion_log_ids = {x.get("unique") for x in self._deletion_log if x.get("unique")}
-
-    def _append_deletion_log(self, entry: dict):
-        """追加一条删除记录并落库（超出上限丢最旧的）。"""
-        entry.setdefault("unique", _now_unique(entry))
-        with self._deletion_log_lock:
-            self._deletion_log.append(entry)
-            self._deletion_log_ids.add(entry["unique"])
-            if len(self._deletion_log) > DELETION_LOG_LIMIT:
-                drop = self._deletion_log[:-DELETION_LOG_LIMIT]
-                self._deletion_log = self._deletion_log[-DELETION_LOG_LIMIT:]
-                for d in drop:
-                    self._deletion_log_ids.discard(d.get("unique"))
-        self._flush_deletion_log(entry)
-
-    def _flush_deletion_log(self, new_entry: Optional[dict] = None):
-        """写入记录文件。优先增量 append，失败或不支持时整表覆盖。"""
+        # 兼容旧版本：曾把记录存在插件数据库里，若有则迁移到文件后清掉。
         try:
-            if new_entry is not None and self._append_json_line(new_entry):
-                return
-            with self._deletion_log_lock:
-                snapshot = list(self._deletion_log)
-            self.save_data(self._TMPLOG_KEY, snapshot)
-        except Exception as e:
-            logger.error(f"软链接监控：保存删除记录失败：{e}")
-
-    def _append_json_line(self, entry: dict) -> bool:
-        """把一条记录以 JSON 行追加到插件数据目录（避免整表重写）。"""
-        try:
-            path = Path(self.get_data_path()) / "deletion_log.jsonl"
-            with path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            return True
+            legacy = self.get_data(self._TMPLOG_KEY)
+            if isinstance(legacy, list) and legacy:
+                for old in legacy:
+                    if isinstance(old, dict):
+                        self._deletion_log.append(old)
+                self._rewrite_log()
+            self.save_data(self._TMPLOG_KEY, [])
         except Exception:
-            return False
+            pass
+
+    def _read_log(self, limit: Optional[int] = None) -> List[dict]:
+        """读记录文件（容错的 JSONL 解析），返回最新 limit 条（倒序）。"""
+        try:
+            path = self._log_path()
+            if not path.is_file():
+                return []
+            rows = []
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    rows.append(obj)
+            rows.sort(key=lambda r: str(r.get("time", "")), reverse=True)
+            return rows[:limit] if limit else rows
+        except Exception as e:
+            logger.warn(f"软链接监控：读取删除记录失败：{e}")
+            return []
+
+    def _rewrite_log(self):
+        """整表重写记录文件（只在裁剪/清理时需要）。"""
+        try:
+            path = self._log_path()
+            with path.open("w", encoding="utf-8") as f:
+                for entry in self._deletion_log:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.error(f"软链接监控：重写删除记录失败：{e}")
 
     def _tail_delete_log(self, limit: int = 20) -> List[dict]:
-        """读取删除记录，返回最新 limit 条（倒序）。"""
-        try:
-            path = Path(self.get_data_path()) / "deletion_log.jsonl"
-            if path.is_file():
-                rows = []
-                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        continue
-                    if isinstance(obj, dict):
-                        rows.append(obj)
-                if rows:
-                    rows.sort(key=lambda r: r.get("time", ""), reverse=True)
-                    return rows[:limit]
-        except Exception as e:
-            logger.warn(f"软链接监控：读取删除记录文件失败，回退数据库：{e}")
-        with self._deletion_log_lock:
-            rows = list(self._deletion_log)
-        rows.sort(key=lambda r: r.get("time", ""), reverse=True)
+        """对外统一入口：返回最新 limit 条记录（倒序）。"""
+        rows = self._read_log()
+        if len(rows) > DELETION_LOG_LIMIT:
+            rows = rows[:DELETION_LOG_LIMIT]
         return rows[:limit]
+
+    def _append_deletion_log(self, entry: dict):
+        """追加一条删除记录（追加写文件），并同步内存缓存。"""
+        entry.setdefault("unique", _now_unique(entry))
+        try:
+            path = self._log_path()
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.error(f"软链接监控：写入删除记录失败：{e}")
+            return
+        self._deletion_log.append(entry)
+        self._deletion_log_ids.add(entry["unique"])
+        # 超出上限：裁剪文件
+        if len(self._deletion_log) > DELETION_LOG_LIMIT:
+            self._deletion_log = self._deletion_log[-DELETION_LOG_LIMIT:]
+            self._deletion_log_ids = {x.get("unique") for x in self._deletion_log
+                                      if x.get("unique")}
+            self._rewrite_log()
 
     def _clear_delete_log(self):
         """清空删除记录。"""
-        with self._deletion_log_lock:
-            self._deletion_log = []
-            self._deletion_log_ids = set()
+        self._deletion_log = []
+        self._deletion_log_ids = set()
         try:
-            path = Path(self.get_data_path()) / "deletion_log.jsonl"
+            path = self._log_path()
             if path.is_file():
                 path.unlink()
         except Exception as e:
             logger.warn(f"软链接监控：删除记录文件清理失败：{e}")
         try:
             self.save_data(self._TMPLOG_KEY, [])
-        except Exception as e:
-            logger.error(f"软链接监控：清空删除记录失败：{e}")
+        except Exception:
+            pass
+
+    def _log_count(self) -> int:
+        """记录总数（与列表同源）。"""
+        return len(self._read_log(limit=DELETION_LOG_LIMIT))
 
     # -------------------------------------------------------------- 延迟删除
 
@@ -983,7 +1001,7 @@ class SymlinkMonitor(_PluginBase):
             "link_dirs": [str(v) for v in self._dirconf.values()],
             "exclude_dirs": [x.strip() for x in self._exclude_dirs.splitlines() if x.strip()],
             "status": self.status_text(),
-            "deletion_log_count": len(self._deletion_log),
+            "deletion_log_count": self._log_count(),
         }}
 
     def api_deletions(self, limit: int = DELETION_LOG_SHOW):
@@ -1056,7 +1074,7 @@ class SymlinkMonitor(_PluginBase):
                     {
                         "component": "div",
                         "props": {"class": "text-subtitle-1 font-weight-bold mb-2"},
-                        "text": f"🗒️ 最近删除记录（最新 {DELETION_LOG_SHOW} 条 / 共 {len(self._deletion_log)} 条）",
+                        "text": f"🗒️ 最近删除记录（最新 {DELETION_LOG_SHOW} 条 / 共 {self._log_count()} 条）",
                     },
                     self._build_log_table(rows),
                 ],

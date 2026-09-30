@@ -162,6 +162,13 @@ for i in range(mod.DELETION_LOG_LIMIT + 30):
 check(f"内存记录不超过上限 {mod.DELETION_LOG_LIMIT}",
       len(p._deletion_log) <= mod.DELETION_LOG_LIMIT, f"{len(p._deletion_log)} 条")
 
+print("\n=== 6b. 计数与列表必须同源（曾出现 5 vs 2 的不一致）===")
+n_list = len(p._tail_delete_log(mod.DELETION_LOG_LIMIT))
+n_count = p._log_count()
+n_status = (p.api_status().get("data") or {}).get("deletion_log_count")
+check("_log_count 与列表长度一致", n_count == n_list, f"count={n_count} list={n_list}")
+check("api_status 计数与列表一致", n_status == n_list, f"status={n_status} list={n_list}")
+
 print("\n=== 7. API 输出 ===")
 res = p.api_deletions()
 check("api_deletions 返回 success", res.get("success") is True)
