@@ -1,14 +1,16 @@
 # MoviePilot Plugins（自建插件仓）
 
-个人维护的 MoviePilot 插件仓库，可直接作为 `PLUGIN_MARKET` 源使用。
+个人维护的 MoviePilot **V3** 插件仓库，可直接作为 `PLUGIN_MARKET` 源使用。
 
-遵循 [jxxghp/MoviePilot-Plugins](https://github.com/jxxghp/MoviePilot-Plugins) 的仓库规范（见其 `docs/Repository_Guide.md`）。
+遵循 [jxxghp/MoviePilot-Plugins](https://github.com/jxxghp/MoviePilot-Plugins) 的仓库规范
+（`docs/Plugin_Development.md` + `docs/Repository_Guide.md`）：V3 新插件使用
+`plugins.v3/` + `tests/v3/` + `package.v3.json`。
 
 ## 插件列表
 
 | 插件 | 说明 | 版本 |
 | --- | --- | --- |
-| [软链接监控](plugins/symlinkmonitor/README.md) | 只监控不建链：下载目录文件删除后，延迟清理软链接目录中指向它的链接，并联动清理刮削文件、转移记录与下载种子 | 2.2.3 |
+| [软链接监控](plugins.v3/symlinkmonitor/README.md) | 只监控不建链：下载目录文件删除后，延迟清理软链接目录中指向它的链接，并联动清理刮削文件、转移记录与下载种子 | 3.0.0 |
 
 ## 使用方法
 
@@ -37,28 +39,37 @@ https://github.com/sanqianxingluo/MoviePilot-Plugins
 
 ```
 .
-├── package.json                 # 插件索引（V2/V3 通用，本插件声明 v2: true）
+├── package.v3.json              # V3 插件市场索引
+├── package.json                 # 默认历史索引（本仓无 plugins/，留空）
 ├── LICENSE                      # GPL-3.0
 ├── icons/                       # 插件图标
-├── plugins/                     # 插件实现（package.json 声明 v2: true 时由 V2 宿主加载）
+├── plugins.v3/                  # V3 专用插件实现
 │   └── symlinkmonitor/
-└── tests/
-    └── v2/
-        └── symlinkmonitor/      # 单测（需在 MoviePilot 容器内运行，见 tests/README.md）
+├── tests/
+│   └── v3/
+│       └── symlinkmonitor/      # 单测（需在 MoviePilot 容器内运行，见 tests/README.md）
+└── .github/                     # 发布工作流与校验脚本（照官方）
 ```
 
-**一个插件只保留一套实现。** 不要同时放 `plugins/` 与 `plugins.v2/` 的同名副本：
-宿主按 `VERSION_FLAG` 只会加载其中一个，重复副本会造成「改一处、漏一处」。
+**一个插件只保留一套实现。** 不要同时放 `plugins/`、`plugins.v2/` 与 `plugins.v3/`
+的同名副本：宿主按 `VERSION_FLAG` 只会加载其中一个，重复副本会造成「改一处、漏一处」。
 
 ## 版本目录解析规则（宿主实测）
 
 宿主按 `VERSION_FLAG` 依次尝试：
 
-1. `package.v2.json` 里有该插件 → 加载 `plugins.v2/<id>/`
-2. 否则看 `package.json`，若该插件 `"v2": true` → 加载 `plugins/<id>/`
+1. `package.v3.json` 里有该插件 → 加载 `plugins.v3/<id>/`
+2. 否则看默认索引 `package.json`，若该插件 `"v2": true` → 加载 `plugins/<id>/`
 3. 都没有 → 插件不可用
 
-因此只需 V2 兼容、不需要单独维护代码目录时，**只放 `package.json` + `plugins/` + `"v2": true`** 即可。
+本仓只提供 V3 实现，因此只有 `package.v3.json` 有条目。
+
+## 发布
+
+`.github/workflows/release.yml`（照官方）在 `package*.json` 变更时触发，
+对索引里 `"release": true` 的条目自动打 Tag `插件ID_v版本号` 并发布
+`插件目录小写_v版本号.zip`。推送前会先跑两道门禁：
+`check_plugin_versions.py`（三处版本一致）与 `check_federation_css.py`（联邦样式）。
 
 ## 许可
 

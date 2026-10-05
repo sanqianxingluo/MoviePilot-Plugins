@@ -41,10 +41,10 @@ MoviePilot 软链接清理插件 (SymlinkMonitor)
   delete_torrents    联动删除下载种子
   clean_empty_dir    联动清理空目录
 
-兼容说明：本插件使用 MoviePilot 公开的宿主接口（app.plugins / app.log /
-app.core.event / app.schemas.types / app.db.transferhistory_oper）。
-日志入口在 V3 上优先取 app.sdk.logging，缺失时回退 app.log，因此同一份
-实现可同时运行在 V2.x 与 V3 宿主上。
+兼容说明：本插件是 MoviePilot V3 专用实现，只用宿主公开的稳定接口
+（app.sdk.* / app.plugins / app.schemas.types / app.db.transferhistory_oper）。
+按官方规范，V3 新插件不再依赖 app.core.* / app.helper.* / app.utils.* 等
+仅由兼容层承接的旧路径。
 """
 
 import json
@@ -62,25 +62,12 @@ from app.plugins import _PluginBase
 from app.schemas import NotificationType
 from app.schemas.types import EventType
 
-# V3 统一从 app.sdk.* 导入；V2 上没有 sdk 包，逐项回退到旧路径。
-# 本插件 V2/V3 共用一份实现，两边都必须能加载。
-try:  # V3 稳定 SDK
-    from app.sdk.events import Event, eventmanager
-except Exception:  # V2 及更早
-    from app.core.event import Event, eventmanager
-
-try:  # V3 稳定 SDK
-    from app.sdk.logging import logger
-except Exception:  # V2 及更早
-    from app.log import logger
-
-try:  # V3 稳定 SDK
-    from app.sdk.config import settings
-except Exception:
-    try:
-        from app.core.config import settings
-    except Exception:  # pragma: no cover - 极端兜底
-        settings = None
+# 本插件是 MoviePilot V3 专用实现，统一从 app.sdk.* 导入。
+# app.core.* / app.helper.* / app.utils.* 是宿主给存量 V2 插件的兼容桥接，
+# 新插件不得使用（见官方 docs/Plugin_Development.md 第 6 节）。
+from app.sdk.config import settings
+from app.sdk.events import Event, eventmanager
+from app.sdk.logging import logger
 
 
 # 下载器尚未完成的临时文件后缀
@@ -133,7 +120,7 @@ class SymlinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkace_C.png"
     # 插件版本
-    plugin_version = "2.2.4"
+    plugin_version = "3.0.0"
     # 插件作者
     plugin_author = "sanqianxingluo"
     # 作者主页
@@ -740,10 +727,7 @@ class SymlinkMonitor(_PluginBase):
             return
         # 没有转移记录时，退化为按保存路径匹配下载任务
         try:
-            try:  # V3 稳定 SDK
-                from app.sdk.services import DownloaderHelper
-            except Exception:  # V2 及更早
-                from app.helper.downloader import DownloaderHelper
+            from app.sdk.services import DownloaderHelper
             services = DownloaderHelper().get_services()
             if not services:
                 return

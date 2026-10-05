@@ -1,6 +1,6 @@
 # 软链接监控（SymlinkMonitor）
 
-MoviePilot 插件：**只监控，不建链**。盯着下载目录，发现文件被删除后延迟确认，
+MoviePilot **V3** 插件：**只监控，不建链**。盯着下载目录，发现文件被删除后延迟确认，
 再把软链接目录（媒体库）里指向它的那个链接删掉，并联动清理刮削文件、转移记录、
 下载种子与空目录。
 
@@ -70,7 +70,7 @@ https://github.com/sanqianxingluo/MoviePilot-Plugins
 
 ## 测试
 
-用例在 `tests/v2/symlinkmonitor/` 下，需在 **MoviePilot 容器内**运行（依赖 `app.*` 模块）：
+用例在 `tests/v3/symlinkmonitor/` 下，需在 **MoviePilot 容器内**运行（依赖 `app.*` 模块）：
 
 - `test_symlinkmonitor.py` — 纯逻辑单测（配置解析、保护目录、排除规则、刮削匹配、链接目标解析等）
 - `test_protect_dirs.py` — 保护目录语义（照常监控但绝不删除）

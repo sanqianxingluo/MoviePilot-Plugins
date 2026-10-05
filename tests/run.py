@@ -28,6 +28,9 @@ def compatible_v2_test_targets(
         package_path: Path = _V2_PACKAGE,
 ) -> list[Path]:
     """按市场兼容标记收集仍由 V3 主程序承载的 V2 插件测试目录。"""
+    v2_tests = tests_dir / "v2"
+    if not v2_tests.is_dir():
+        return []  # 只有 V3 实现的仓库没有 v2 分组
     if not package_path.exists():
         # 没有 V2 专用索引时回退到默认索引，只认声明了 "v2": true 的条目
         package_path = _V2_FALLBACK
@@ -39,7 +42,7 @@ def compatible_v2_test_targets(
         if not fallback or metadata.get("v2") is True
     }
     targets = []
-    for test_dir in sorted((tests_dir / "v2").iterdir()):
+    for test_dir in sorted(v2_tests.iterdir()):
         if not _contains_tests(test_dir):
             continue
         metadata = metadata_by_id.get(test_dir.name.casefold())
