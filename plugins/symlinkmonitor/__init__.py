@@ -57,21 +57,30 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.core.event import eventmanager, Event
 from app.db.transferhistory_oper import TransferHistoryOper
 from app.plugins import _PluginBase
 from app.schemas import NotificationType
 from app.schemas.types import EventType
+
+# V3 统一从 app.sdk.* 导入；V2 上没有 sdk 包，逐项回退到旧路径。
+# 本插件 V2/V3 共用一份实现，两边都必须能加载。
+try:  # V3 稳定 SDK
+    from app.sdk.events import Event, eventmanager
+except Exception:  # V2 及更早
+    from app.core.event import Event, eventmanager
 
 try:  # V3 稳定 SDK
     from app.sdk.logging import logger
 except Exception:  # V2 及更早
     from app.log import logger
 
-try:
-    from app.core.config import settings
-except Exception:  # pragma: no cover - 极端兜底
-    settings = None
+try:  # V3 稳定 SDK
+    from app.sdk.config import settings
+except Exception:
+    try:
+        from app.core.config import settings
+    except Exception:  # pragma: no cover - 极端兜底
+        settings = None
 
 
 # 下载器尚未完成的临时文件后缀
@@ -731,7 +740,10 @@ class SymlinkMonitor(_PluginBase):
             return
         # 没有转移记录时，退化为按保存路径匹配下载任务
         try:
-            from app.helper.downloader import DownloaderHelper
+            try:  # V3 稳定 SDK
+                from app.sdk.services import DownloaderHelper
+            except Exception:  # V2 及更早
+                from app.helper.downloader import DownloaderHelper
             services = DownloaderHelper().get_services()
             if not services:
                 return
