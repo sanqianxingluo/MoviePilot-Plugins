@@ -1,76 +1,23 @@
-# MoviePilot Plugins（自建插件仓）
+# MoviePilot-Plugins
 
-个人维护的 MoviePilot **V3** 插件仓库，可直接作为 `PLUGIN_MARKET` 源使用。
+MoviePilot官方插件市场：https://github.com/jxxghp/MoviePilot-Plugins
 
-遵循 [jxxghp/MoviePilot-Plugins](https://github.com/jxxghp/MoviePilot-Plugins) 的仓库规范
-（`docs/Plugin_Development.md` + `docs/Repository_Guide.md`）：V3 新插件使用
-`plugins.v3/` + `tests/v3/` + `package.v3.json`。
+## 插件目录
 
-## 插件列表
+1. [软链接监控](https://github.com/sanqianxingluo/MoviePilot-Plugins/tree/main/plugins.v3/symlinkmonitor)：只监控不建链。下载目录文件删除后延迟清理软链接目录中指向它的链接，并联动清理刮削文件、转移记录与下载种子；保护目录里的内容永不删除。
 
-| 插件 | 说明 | 版本 |
-| --- | --- | --- |
-| [软链接监控](plugins.v3/symlinkmonitor/README.md) | 只监控不建链：下载目录文件删除后，延迟清理软链接目录中指向它的链接，并联动清理刮削文件、转移记录与下载种子 | 3.0.0 |
+## 更新日志
 
-## 使用方法
-
-### 方式一：添加为插件市场
-
-在 MoviePilot 的「设置 → 插件市场」中追加本仓库地址：
-
-```
-https://github.com/sanqianxingluo/MoviePilot-Plugins
-```
-
-### 方式二：本地插件仓库（推荐自用）
-
-1. 把本仓库放到 MoviePilot 能读到的目录，例如
-   `/volume1/docker/docker/moviepilot-v2/config/localrepo/`
-2. 在 `config/app.env` 加入：
-
-   ```
-   PLUGIN_LOCAL_REPO_PATHS='/config/localrepo'
-   ```
-
-   多个路径用逗号分隔。**改完需重启 MoviePilot 容器**（启动时才会扫描本地仓库）。
-3. 重启后在插件市场中即可看到本地插件并安装。
-
-## 目录结构
-
-```
-.
-├── package.v3.json              # V3 插件市场索引
-├── package.json                 # 默认历史索引（本仓无 plugins/，留空）
-├── LICENSE                      # GPL-3.0
-├── icons/                       # 插件图标
-├── plugins.v3/                  # V3 专用插件实现
-│   └── symlinkmonitor/
-├── tests/
-│   └── v3/
-│       └── symlinkmonitor/      # 单测（需在 MoviePilot 容器内运行，见 tests/README.md）
-└── .github/                     # 发布工作流与校验脚本（照官方）
-```
-
-**一个插件只保留一套实现。** 不要同时放 `plugins/`、`plugins.v2/` 与 `plugins.v3/`
-的同名副本：宿主按 `VERSION_FLAG` 只会加载其中一个，重复副本会造成「改一处、漏一处」。
-
-## 版本目录解析规则（宿主实测）
-
-宿主按 `VERSION_FLAG` 依次尝试：
-
-1. `package.v3.json` 里有该插件 → 加载 `plugins.v3/<id>/`
-2. 否则看默认索引 `package.json`，若该插件 `"v2": true` → 加载 `plugins/<id>/`
-3. 都没有 → 插件不可用
-
-本仓只提供 V3 实现，因此只有 `package.v3.json` 有条目。
-
-## 发布
-
-`.github/workflows/release.yml`（照官方）在 `package*.json` 变更时触发，
-对索引里 `"release": true` 的条目自动打 Tag `插件ID_v版本号` 并发布
-`插件目录小写_v版本号.zip`。推送前会先跑两道门禁：
-`check_plugin_versions.py`（三处版本一致）与 `check_federation_css.py`（联邦样式）。
-
-## 许可
-
-GPL-3.0（与官方插件仓一致，见 [LICENSE](LICENSE)）。
+| 时间 | 插件 | 更新内容 |
+| ---  | --- | --- |
+| 2026/10/05 | 软链接监控 | 转为 MoviePilot V3 专用实现（3.0.0）：代码迁入 plugins.v3/，导入统一走 app.sdk.*，测试迁到 tests/v3/ |
+| 2026/09/30 | 软链接监控 | 适配 MoviePilot V3：索引去掉会阻止 V3 回退加载的 v3:false 与 <3 版本上限 |
+| 2026/09/30 | 软链接监控 | 规范化仓库：合并 v2/v3 重复副本为单一实现、补 GPL-3.0 许可、索引字段按官方规范补齐 |
+| 2026/09/30 | 软链接监控 | 统一删除记录的事实源为记录文件（此前列表 5 条而状态显示 2 条不一致） |
+| 2026/09/30 | 软链接监控 | 修复：删除记录漏计「只剩刮削的目录」清理掉的条目；表格新增「目录」列 |
+| 2026/09/30 | 软链接监控 | 详情页新增「最近 20 条删除记录」可视化表格，并新增 /deletions、/clear_log API |
+| 2026/09/30 | 软链接监控 | 修复：源侧「只剩刮削文件」的清理会绕过「下载目录只读」开关 |
+| 2026/09/30 | 软链接监控 | 「不删除目录」改为「保护目录」语义：照常监控但绝不删除；新增「清理下载目录刮削」开关（默认关） |
+| 2026/09/30 | 软链接监控 | 防呆：保护目录覆盖监控目录时忽略该监控项并告警，避免删除事件静默失灵 |
+| 2026/09/30 | 软链接监控 | 改为纯清理插件：不再建立软链接，只做「删源文件 → 清软链接」的联动清理 |
+| 2026/09/30 | 软链接监控 | 首个版本：软链接监控、延迟删除、联动删种、刮削清理、转移记录清理、通知、立即运行 |
