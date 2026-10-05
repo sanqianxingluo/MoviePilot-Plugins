@@ -100,7 +100,8 @@ def test_deletion_log():
     page = p.get_page()
     check("get_page 返回非空列表", isinstance(page, list) and len(page) > 0)
     flat = json.dumps(page, ensure_ascii=False, default=str)
-    check("页面含统计卡片", "已删软链接" in flat and "已处理批次" in flat)
+    check("页面含统计卡片", "累计删除软链接" in flat and "累计处理批次" in flat)
+    check("页面含本次运行卡片", "本次已删软链接" in flat and "本次处理批次" in flat)
     check("页面含表格组件", "VDataTableVirtual" in flat)
     check("表格含列头（时间/软链/刮削/目录）",
           all(k in flat for k in ("时间", "软链", "刮削", "目录", "源文件")))

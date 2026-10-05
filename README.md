@@ -4,7 +4,7 @@ MoviePilot 第三方插件仓库：https://github.com/sanqianxingluo/MoviePilot-
 
 ## 插件列表
 
-1. [软链接监控 v3.0.0](https://github.com/sanqianxingluo/MoviePilot-Plugins/tree/main/plugins.v3/symlinkmonitor)：只监控不建链。下载目录文件删除后延迟清理软链接目录中指向它的链接，并联动清理刮削文件、转移记录与下载种子；保护目录里的内容永不删除。
+1. [软链接监控 v3.1.0](https://github.com/sanqianxingluo/MoviePilot-Plugins/tree/main/plugins.v3/symlinkmonitor)：只监控不建链。下载目录文件删除后延迟清理软链接目录中指向它的链接，并联动清理刮削文件、转移记录与下载种子；保护目录里的内容永不删除。
 
 ## 安装
 

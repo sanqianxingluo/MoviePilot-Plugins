@@ -120,7 +120,7 @@ class SymlinkMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Linkace_C.png"
     # 插件版本
-    plugin_version = "3.0.0"
+    plugin_version = "3.1.0"
     # 插件作者
     plugin_author = "sanqianxingluo"
     # 作者主页
@@ -147,6 +147,12 @@ class SymlinkMonitor(_PluginBase):
     _delete_history = True
     _delete_torrents = True
     _clean_empty_dir = True
+    # 干跑：只记录「本来会删什么」，不执行任何删除
+    _dry_run = False
+    # 单次扫描允许删除的上限；0 = 不限。超过则本轮不执行并告警（防挂载失败导致的批量误删）
+    _max_delete_per_scan = 0
+    # 联动清理完成后通知媒体服务器刷新媒体库
+    _refresh_library = False
 
     # ---- 运行时状态 ----
     # {下载目录: 软链接目录}
@@ -160,6 +166,8 @@ class SymlinkMonitor(_PluginBase):
     _history = None
     # 本次运行统计
     _stat = {"delete": 0, "link": 0, "sweep": 0, "fail": 0}
+    # 熔断上次告警时间（用于去重，避免每轮刷屏）
+    _breaker_last_warn: Optional[datetime] = None
 
     # ---- 删除记录（详情页可视化，落库持久化）----
     _deletion_log: List[dict] = []
@@ -190,6 +198,12 @@ class SymlinkMonitor(_PluginBase):
             self._delete_history = bool(config.get("delete_history", True))
             self._delete_torrents = bool(config.get("delete_torrents", True))
             self._clean_empty_dir = bool(config.get("clean_empty_dir", True))
+            self._dry_run = bool(config.get("dry_run", False))
+            self._refresh_library = bool(config.get("refresh_library", False))
+            try:
+                self._max_delete_per_scan = max(0, int(config.get("max_delete_per_scan") or 0))
+            except (TypeError, ValueError):
+                self._max_delete_per_scan = 0
             try:
                 self._scan_interval = max(3, int(config.get("scan_interval") or 10))
             except (TypeError, ValueError):
@@ -262,6 +276,9 @@ class SymlinkMonitor(_PluginBase):
             "delete_history": self._delete_history,
             "delete_torrents": self._delete_torrents,
             "clean_empty_dir": self._clean_empty_dir,
+            "dry_run": self._dry_run,
+            "max_delete_per_scan": self._max_delete_per_scan,
+            "refresh_library": self._refresh_library,
         })
 
     def get_state(self) -> bool:
@@ -289,10 +306,39 @@ class SymlinkMonitor(_PluginBase):
         with _state_lock:
             old = self._snapshot
         removed = [p for p in old if p not in current]
+
+        # 熔断：一轮内消失的文件过多，通常是挂载失败 / 权限异常 / 目录被临时
+        # 移走导致的假象，而非真的删除。此时既不清理、也不更新快照基线，
+        # 保住原快照，等下轮复核（挂载恢复后文件会重新出现，自然归于无事）。
+        if self._max_delete_per_scan and len(removed) > self._max_delete_per_scan:
+            self._trip_breaker(len(removed))
+            return
+
         for path in removed:
             self._enqueue_deletion(path)
         with _state_lock:
             self._snapshot = current
+
+    def _trip_breaker(self, count: int):
+        """触发熔断：记录并告警（同一波异常 10 分钟内只提醒一次，避免刷屏）。"""
+        now = datetime.now()
+        with _state_lock:
+            last = self._breaker_last_warn
+            if last and (now - last).total_seconds() < 600:
+                return
+            self._breaker_last_warn = now
+            self._stat["breaker"] = self._stat.get("breaker", 0) + 1
+        msg = (f"本轮有 {count} 个源文件消失，超过单次上限 {self._max_delete_per_scan}，"
+               f"本轮清理已跳过（疑似挂载失败或权限异常）。")
+        logger.error(f"软链接监控：{msg}")
+        if self._notify:
+            self.post_message(
+                mtype=NotificationType.SiteMessage,
+                title="⚠️ 软链接监控已熔断",
+                text="⛔ " + msg + "\n\n监控目录：\n"
+                     + "\n".join(f"　　{x}" for x in self._dirconf)
+                     + "\n\n请确认下载目录是否仍正常挂载；确认无误后可上调上限或临时调大。",
+            )
 
     def _build_snapshot(self) -> Dict[str, Tuple[int, float]]:
         """建立下载目录的文件快照。"""
@@ -619,6 +665,46 @@ class SymlinkMonitor(_PluginBase):
             logger.info(f"软链接监控：源文件 {src} 已重新出现，跳过清理")
             return
 
+        # 干跑：只把「本会删掉什么」记进删除记录，不执行任何删除动作。
+        # 目的：新加监控目录 / 改规则时先预演一遍，确认无误再关掉干跑。
+        if self._dry_run:
+            links = self._find_links(src)
+            would: List[str] = []
+            for link in links:
+                if self._is_protected(link):
+                    continue
+                if not link.is_symlink():
+                    continue
+                would.append(str(link))
+            scrap = 0
+            for link in links:
+                try:
+                    scrap += len([
+                        x for x in link.parent.iterdir()
+                        if x.is_file() and not x.is_symlink()
+                        and x.stem == link.stem
+                    ])
+                except OSError:
+                    pass
+            self._stat["delete"] += 1
+            self._stat["link"] += len(would)
+            self._append_deletion_log({
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "src": _shorten(src),
+                "links": len(would),
+                "link_paths": [_shorten(x) for x in would[:5]],
+                "scrap": scrap,
+                "empty_dirs": 0,
+                "history": None,
+                "torrent": None,
+                "empty": self._clean_empty_dir,
+                "reason": "干跑（未执行）",
+                "dry_run": True,
+            })
+            logger.info(f"软链接监控【干跑】：源文件 {src} 消失，本会删除 {len(would)} 个软链接"
+                        f"{'、联动清理刮削' if self._delete_scrap else ''}（未执行）")
+            return
+
         removed: List[str] = []
         links = self._find_links(src)
 
@@ -702,6 +788,37 @@ class SymlinkMonitor(_PluginBase):
                 title="🧹 软链接联动清理",
                 text="⏰ 延迟删除完成\n\n" + "\n".join(lines),
             )
+
+        # 6. 通知媒体服务器刷新媒体库（链接已删，让 Emby/Jellyfin 重扫）
+        if self._refresh_library:
+            self._refresh_media_libraries()
+
+    def _refresh_media_libraries(self):
+        """联动清理后通知媒体服务器刷新媒体库。失败只记日志，不影响主流程。"""
+        try:
+            from app.sdk.services import MediaServerHelper
+        except Exception as e:
+            logger.error(f"软链接监控：媒体服务器模块不可用，跳过刷新：{e}")
+            return
+        try:
+            services = MediaServerHelper().get_services() or {}
+        except Exception as e:
+            logger.error(f"软链接监控：获取媒体服务器实例失败：{e}")
+            return
+        done: List[str] = []
+        for name, info in services.items():
+            inst = getattr(info, "instance", None)
+            if inst is None or not hasattr(inst, "refresh_root_library"):
+                continue
+            try:
+                if inst.refresh_root_library():
+                    done.append(name)
+            except Exception as e:
+                logger.error(f"软链接监控：通知 {name} 刷新媒体库失败：{e}")
+        if done:
+            logger.info(f"软链接监控：已通知媒体服务器刷新媒体库：{'、'.join(done)}")
+        else:
+            logger.info("软链接监控：没有可刷新的媒体服务器（未配置或刷新失败）")
 
     def _delete_transfer_history(self, src: str) -> Optional[str]:
         """删除源路径对应的转移记录，返回其下载器 hash。"""
@@ -912,11 +1029,22 @@ class SymlinkMonitor(_PluginBase):
 
     def status_text(self) -> str:
         """运行状态描述。"""
+        extra = []
+        if self._dry_run:
+            extra.append("🧪 干跑中（只记录不删除）")
+        if self._max_delete_per_scan:
+            extra.append(f"单次上限 {self._max_delete_per_scan}")
+        if self._refresh_library:
+            extra.append("清理后刷新媒体库")
+        if self._stat.get("breaker"):
+            extra.append(f"⚠️ 熔断 {self._stat['breaker']} 次")
+        tail = ("｜" + "｜".join(extra)) if extra else ""
         return (
             f"监控目录 {len(self._dirconf)} 个｜快照 {len(self._snapshot)} 个文件｜"
             f"待清理 {len(self._deletion_queue)} 项｜已删链接 {self._stat['link']}、"
             f"已处理 {self._stat['delete']} 次、孤儿清理 {self._stat['sweep']}、"
             f"失败 {self._stat['fail']}"
+            + tail
         )
 
     # -------------------------------------------------------------- 宿主接口
@@ -1025,9 +1153,24 @@ class SymlinkMonitor(_PluginBase):
             "kwargs": {"seconds": max(3, min(60, self._scan_interval))},
         }]
 
+    def _lifetime_stats(self) -> dict:
+        """从删除记录汇总统计（记录上限 200 条，故为「最近记录内」的合计）。"""
+        try:
+            rows = self._tail_delete_log(DELETION_LOG_LIMIT)
+        except Exception:
+            rows = []
+        return {
+            "links": sum(int(r.get("links") or 0) for r in rows),
+            "scrap": sum(int(r.get("scrap") or 0) for r in rows),
+            "dirs": sum(int(r.get("empty_dirs") or 0) for r in rows),
+            "batches": len(rows),
+            "dry": sum(1 for r in rows if r.get("dry_run")),
+        }
+
     def get_page(self) -> List[dict]:
-        """详情页：状态卡片 + 最近 20 条删除记录（表格可视化）。"""
+        """详情页：状态卡片 + 累计统计 + 最近 20 条删除记录（表格可视化）。"""
         rows = self._tail_delete_log(DELETION_LOG_SHOW)
+        lt = self._lifetime_stats()
         return [
             {
                 "component": "div",
@@ -1050,8 +1193,19 @@ class SymlinkMonitor(_PluginBase):
                         "component": "VRow",
                         "props": {"class": "mb-2"},
                         "content": [
-                            self._stat_card("已删软链接", self._stat["link"], "mdi-link-variant-off", "primary"),
-                            self._stat_card("已处理批次", self._stat["delete"], "mdi-check-circle-outline", "success"),
+                            self._stat_card("累计删除软链接", lt["links"], "mdi-link-variant-off", "primary"),
+                            self._stat_card("累计清理刮削", lt["scrap"], "mdi-image-multiple-outline", "info"),
+                            self._stat_card("累计处理批次", lt["batches"], "mdi-history", "success"),
+                            self._stat_card("干跑记录", lt["dry"], "mdi-test-tube",
+                                            "warning" if lt["dry"] else "secondary"),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "props": {"class": "mb-2"},
+                        "content": [
+                            self._stat_card("本次已删软链接", self._stat["link"], "mdi-link-variant-off", "primary"),
+                            self._stat_card("本次处理批次", self._stat["delete"], "mdi-check-circle-outline", "success"),
                             self._stat_card("孤儿清理", self._stat["sweep"], "mdi-broom", "info"),
                             self._stat_card("失败", self._stat["fail"], "mdi-alert-circle-outline",
                                             "error" if self._stat["fail"] else "secondary"),
@@ -1183,6 +1337,16 @@ class SymlinkMonitor(_PluginBase):
                         "component": "VRow",
                         "content": [
                             self._switch("clean_empty_dir", "清理空目录", 12, 3),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self._switch("dry_run", "干跑模式（只记录不删除）", 12, 3),
+                            self._switch("refresh_library", "清理后刷新媒体库", 12, 3),
+                            self._text("max_delete_per_scan", "单次删除上限",
+                                       "一轮内消失的文件数超过此值则熔断、本轮不清理（防挂载失败误删）；0 = 不限",
+                                       12, 6),
                         ],
                     },
                     {
