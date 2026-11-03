@@ -39,7 +39,7 @@ class P115AutoUpload(_PluginBase):
         "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/"
         "src/assets/images/misc/u115.png"
     )
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_label = "云盘,上传,115"
     plugin_author = "local"
     plugin_config_prefix = "p115autoupload_"

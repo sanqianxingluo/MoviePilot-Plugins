@@ -28,12 +28,14 @@
     "name": "115自动上传",
     "description": "监听 MoviePilot 整理完成事件，把新入库的影视文件自动上传到 115 网盘；上传前校验 115 是否已存在，重复时不上传并发送提示。",
     "labels": "云盘,上传,115",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "u115.png",
     "author": "local",
     "level": 1,
+    "release": true,
     "system_version": ">=3.2.0",
     "history": {
+      "v1.0.1": "验证软链接与硬链接入库文件的上传与索引；开启 GitHub Release 打包分发。",
       "v1.0.0": "初始版本：整理完成后自动上传到 115，支持路径映射、上传前查重与重复提示"
     }
   }
