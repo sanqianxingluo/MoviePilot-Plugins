@@ -39,7 +39,7 @@ class P115AutoUpload(_PluginBase):
         "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/"
         "src/assets/images/misc/u115.png"
     )
-    plugin_version = "1.0.1"
+    plugin_version = "1.1.0"
     plugin_label = "云盘,上传,115"
     plugin_author = "local"
     plugin_config_prefix = "p115autoupload_"
@@ -51,6 +51,7 @@ class P115AutoUpload(_PluginBase):
     _dedup = True
     _include_sidecar = True
     _max_workers = 1
+    _max_fail_count = 3
     _mappings = DEFAULT_MAPPINGS
     _uploader: Optional[P115Uploader] = None
     _executor: Optional[ThreadPoolExecutor] = None
@@ -71,6 +72,9 @@ class P115AutoUpload(_PluginBase):
         self._dedup = bool(config.get("dedup", True))
         self._include_sidecar = bool(config.get("include_sidecar", True))
         self._max_workers = max(1, min(4, int(config.get("max_workers") or 1)))
+        self._max_fail_count = max(
+            0, min(20, int(config.get("max_fail_count", 3) or 0))
+        )
         self._mappings = str(config.get("mappings") or DEFAULT_MAPPINGS).strip()
         if not config.get("enabled"):
             return
@@ -93,6 +97,8 @@ class P115AutoUpload(_PluginBase):
             mappings=self._mappings,
             dedup=self._dedup,
             include_sidecar=self._include_sidecar,
+            max_fail_count=self._max_fail_count,
+            fail_counts=self.get_data("fail_counts") or {},
         )
         self._enabled = True
         logger.info("115自动上传：插件已启用")
@@ -121,8 +127,25 @@ class P115AutoUpload(_PluginBase):
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        """本插件不注册 API。"""
-        return []
+        """注册详情页使用的 API。"""
+        return [
+            {
+                "path": "/reset_failures",
+                "endpoint": self.api_reset_failures,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "清空失败次数记录",
+                "description": "清空后，此前因失败次数达到上限而停止上传的文件会重新尝试",
+            }
+        ]
+
+    def api_reset_failures(self) -> Dict[str, Any]:
+        """清空失败次数记录，让被放弃的文件重新参与上传。"""
+        if self._uploader is not None:
+            self._uploader.fail_counts.clear()
+        self.save_data("fail_counts", {})
+        logger.info("115自动上传：已清空失败次数记录")
+        return {"success": True, "message": "失败次数记录已清空"}
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """返回插件配置表单与默认配置。"""
@@ -130,57 +153,101 @@ class P115AutoUpload(_PluginBase):
             {
                 "component": "VForm",
                 "content": [
-                    {
-                        "component": "VRow",
-                        "content": [
-                            self._switch("enabled", "启用插件", 3),
-                            self._switch("notify", "发送通知", 3),
-                            self._switch("dedup", "上传前查重", 3),
-                            self._switch("include_sidecar", "上传附属文件", 3),
+                    self._section(
+                        "基础设置",
+                        "开关类选项，保存后立即生效。",
+                        [
+                            {
+                                "component": "VRow",
+                                "props": {"class": "mt-1"},
+                                "content": [
+                                    self._switch("enabled", "启用插件", 12, 6, 3),
+                                    self._switch("notify", "发送通知", 12, 6, 3),
+                                    self._switch("dedup", "上传前查重", 12, 6, 3),
+                                    self._switch(
+                                        "include_sidecar", "上传附属文件", 12, 6, 3
+                                    ),
+                                ],
+                            }
                         ],
-                    },
-                    {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "cookie",
-                            "label": "115 Cookie",
-                            "type": "password",
-                            "placeholder": "UID=...; CID=...; SEID=...",
-                            "hint": f"留空时读取 {COOKIE_FALLBACK}",
-                            "persistent-hint": True,
-                        },
-                    },
-                    {
-                        "component": "VTextarea",
-                        "props": {
-                            "model": "mappings",
-                            "label": "路径映射",
-                            "rows": 5,
-                            "placeholder": "/本地库前缀/ => /115目录/",
-                            "hint": "每行一条：本地前缀 => 115 前缀；前缀越具体越优先",
-                            "persistent-hint": True,
-                        },
-                    },
-                    {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "max_workers",
-                            "label": "上传并发数",
-                            "type": "number",
-                            "min": 1,
-                            "max": 4,
-                            "hint": "建议保持 1，避免触发 115 风控",
-                            "persistent-hint": True,
-                        },
-                    },
+                    ),
+                    self._section(
+                        "上传策略",
+                        "控制并发数量与失败处理方式。",
+                        [
+                            {
+                                "component": "VRow",
+                                "content": [
+                                    self._text(
+                                        "max_workers",
+                                        "上传并发数",
+                                        "取值 1-4，建议保持 1，避免触发 115 风控",
+                                        12,
+                                        6,
+                                        {"type": "number", "min": 1, "max": 4},
+                                    ),
+                                    self._text(
+                                        "max_fail_count",
+                                        "失败次数上限",
+                                        "同一文件累计失败达到该次数后不再上传并通知；填 0 表示一直重试",
+                                        12,
+                                        6,
+                                        {"type": "number", "min": 0, "max": 20},
+                                    ),
+                                ],
+                            }
+                        ],
+                    ),
+                    self._section(
+                        "115 连接",
+                        f"Cookie 留空时自动读取 {COOKIE_FALLBACK}。",
+                        [
+                            {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": "cookie",
+                                    "label": "115 Cookie",
+                                    "type": "password",
+                                    "variant": "outlined",
+                                    "density": "comfortable",
+                                    "class": "mb-4",
+                                    "placeholder": "UID=...; CID=...; SEID=...; KID=...",
+                                    "persistent-hint": True,
+                                    "hint": f"留空时读取 {COOKIE_FALLBACK}",
+                                },
+                            }
+                        ],
+                    ),
+                    self._section(
+                        "路径映射",
+                        "每行一条「本地前缀 => 115 前缀」，前缀越具体越优先。",
+                        [
+                            {
+                                "component": "VTextarea",
+                                "props": {
+                                    "model": "mappings",
+                                    "label": "路径映射",
+                                    "rows": 6,
+                                    "variant": "outlined",
+                                    "density": "comfortable",
+                                    "class": "mb-2",
+                                    "placeholder": "/本地库前缀/ => /115目录/",
+                                    "persistent-hint": True,
+                                    "hint": "支持 => 或 -> 连接；本地链接目录与真实目录都会按映射镜像到 115",
+                                },
+                            }
+                        ],
+                    ),
                     {
                         "component": "VAlert",
                         "props": {
                             "type": "info",
                             "variant": "tonal",
+                            "class": "mt-2",
                             "text": (
                                 "整理完成后自动上传对应文件。115 已存在同版本时不上传并通知；"
-                                "只缺部分集数时仅补传缺失文件。"
+                                "只缺部分集数时仅补传缺失文件；同一文件失败次数达到上限后停止上传，"
+                                "可在插件详情页清空失败记录后重新尝试。"
                             ),
                         },
                     },
@@ -194,20 +261,84 @@ class P115AutoUpload(_PluginBase):
             "cookie": "",
             "mappings": DEFAULT_MAPPINGS,
             "max_workers": 1,
+            "max_fail_count": 3,
         }
 
     @staticmethod
-    def _switch(model: str, label: str, width: int) -> Dict[str, Any]:
+    def _section(title: str, subtitle: str, content: List[dict]) -> Dict[str, Any]:
+        """构造带标题与说明的分区卡片，避免各表单项挤在一起。"""
+        return {
+            "component": "VCard",
+            "props": {"variant": "outlined", "class": "mb-6"},
+            "content": [
+                {
+                    "component": "VCardTitle",
+                    "props": {"class": "text-subtitle-1 pb-0"},
+                    "text": title,
+                },
+                {
+                    "component": "VCardText",
+                    "props": {"class": "pt-3"},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {
+                                "class": "text-caption text-medium-emphasis mb-4"
+                            },
+                            "text": subtitle,
+                        },
+                        *content,
+                    ],
+                },
+            ],
+        }
+
+    @staticmethod
+    def _switch(
+        model: str, label: str, cols: int = 12, sm: int = 6, md: int = 3
+    ) -> Dict[str, Any]:
         """构造一个开关表单项。"""
         return {
             "component": "VCol",
-            "props": {"cols": 12, "md": width},
+            "props": {"cols": cols, "sm": sm, "md": md, "class": "py-2"},
             "content": [
                 {
                     "component": "VSwitch",
-                    "props": {"model": model, "label": label},
+                    "props": {
+                        "model": model,
+                        "label": label,
+                        "density": "comfortable",
+                        "hide-details": True,
+                        "color": "primary",
+                    },
                 }
             ],
+        }
+
+    @staticmethod
+    def _text(
+        model: str,
+        label: str,
+        hint: str,
+        cols: int = 12,
+        md: int = 6,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """构造一个带说明的文本输入表单项。"""
+        props: Dict[str, Any] = {
+            "model": model,
+            "label": label,
+            "variant": "outlined",
+            "density": "comfortable",
+            "class": "mb-4",
+            "persistent-hint": True,
+            "hint": hint,
+        }
+        props.update(extra or {})
+        return {
+            "component": "VCol",
+            "props": {"cols": cols, "md": md, "class": "py-1"},
+            "content": [{"component": "VTextField", "props": props}],
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -237,18 +368,21 @@ class P115AutoUpload(_PluginBase):
             ]
         duplicates = report.get("duplicates") or []
         failures = report.get("failed") or []
+        abandoned = report.get("abandoned") or []
         content: List[dict] = [
             {
                 "component": "VAlert",
                 "props": {
-                    "type": "success" if not failures else "warning",
+                    "type": "success" if not failures and not abandoned else "warning",
                     "variant": "tonal",
+                    "class": "mb-4",
                     "text": (
                         f"最近运行：{report.get('finished_at', '-')}｜"
                         f"上传 {report.get('uploaded', 0)} 个 / "
                         f"{report.get('uploaded_gib', 0)} GiB｜"
                         f"跳过 {report.get('skipped', 0)} 个｜"
-                        f"失败 {len(failures)} 个"
+                        f"失败 {len(failures)} 个｜"
+                        f"停止重试 {len(abandoned)} 个"
                     ),
                 },
             }
@@ -261,6 +395,7 @@ class P115AutoUpload(_PluginBase):
                     "props": {
                         "type": "info",
                         "variant": "tonal",
+                        "class": "mb-4",
                         "title": "115 已存在，未上传",
                         "text": "\n".join(lines),
                     },
@@ -268,7 +403,20 @@ class P115AutoUpload(_PluginBase):
             )
         if failures:
             lines = [
-                f"{item['path']}：{item['error']}" for item in failures[:5]
+                "{path}：{error}{suffix}".format(
+                    path=item.get("path"),
+                    error=item.get("error"),
+                    suffix=(
+                        f"（已失败 {item['count']} 次，停止重试）"
+                        if item.get("stopped")
+                        else (
+                            f"（已失败 {item['count']} 次）"
+                            if item.get("count")
+                            else ""
+                        )
+                    ),
+                )
+                for item in failures[:5]
             ]
             content.append(
                 {
@@ -276,9 +424,54 @@ class P115AutoUpload(_PluginBase):
                     "props": {
                         "type": "error",
                         "variant": "tonal",
+                        "class": "mb-4",
                         "title": "上传失败",
                         "text": "\n".join(lines),
                     },
+                }
+            )
+        if abandoned:
+            lines = [
+                f"{item['path']}（失败 {item['count']} 次）" for item in abandoned[:10]
+            ]
+            content.append(
+                {
+                    "component": "VCard",
+                    "props": {"variant": "outlined", "class": "mb-4"},
+                    "content": [
+                        {
+                            "component": "VCardTitle",
+                            "props": {"class": "text-subtitle-1 pb-2"},
+                            "text": f"已停止上传（{len(abandoned)} 个）",
+                        },
+                        {
+                            "component": "VCardText",
+                            "props": {"class": "pt-0"},
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-body-2 mb-3"},
+                                    "text": "\n".join(lines),
+                                },
+                                {
+                                    "component": "VBtn",
+                                    "props": {
+                                        "color": "warning",
+                                        "variant": "tonal",
+                                        "size": "small",
+                                        "prepend-icon": "mdi-restart",
+                                    },
+                                    "text": "清空失败记录",
+                                    "events": {
+                                        "click": {
+                                            "api": f"plugin/{self.__class__.__name__}/reset_failures",
+                                            "method": "get",
+                                        }
+                                    },
+                                },
+                            ],
+                        },
+                    ],
                 }
             )
         return content
@@ -361,15 +554,17 @@ class P115AutoUpload(_PluginBase):
             report["title"] = title
             report["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             report["elapsed_sec"] = round(time.time() - started, 1)
+            self.save_data("fail_counts", uploader.fail_counts)
             self.save_data("last_report", report)
             logger.info(
-                "115自动上传：{} 完成，上传 {} 个（{} GiB），跳过 {} 个，重复目录 {} 个，失败 {} 个".format(
+                "115自动上传：{} 完成，上传 {} 个（{} GiB），跳过 {} 个，重复目录 {} 个，失败 {} 个，停止重试 {} 个".format(
                     title,
                     report.get("uploaded", 0),
                     report.get("uploaded_gib", 0),
                     report.get("skipped", 0),
                     len(report.get("duplicates") or []),
                     len(report.get("failed") or []),
+                    len(report.get("abandoned") or []),
                 )
             )
             self._notify_result(title, report)
@@ -398,7 +593,31 @@ class P115AutoUpload(_PluginBase):
         failures = report.get("failed") or []
         if failures:
             lines.append(f"上传失败 {len(failures)} 个文件：")
-            lines.extend(f"- {item['path']}：{item['error']}" for item in failures[:5])
+            lines.extend(
+                "- {path}：{error}{suffix}".format(
+                    path=item.get("path"),
+                    error=item.get("error"),
+                    suffix=(
+                        f"（已连续失败 {item['count']} 次，达到上限后不再上传）"
+                        if item.get("stopped")
+                        else (
+                            f"（已失败 {item['count']} 次）"
+                            if item.get("count")
+                            else ""
+                        )
+                    ),
+                )
+                for item in failures[:5]
+            )
+        abandoned = report.get("abandoned") or []
+        if abandoned:
+            lines.append(
+                f"以下 {len(abandoned)} 个文件失败次数已达上限，已停止上传："
+            )
+            lines.extend(
+                f"- {item['path']}（失败 {item['count']} 次）"
+                for item in abandoned[:10]
+            )
         if report.get("ignored"):
             lines.append(f"{report['ignored']} 个文件未命中路径映射，已忽略")
         if not lines:
