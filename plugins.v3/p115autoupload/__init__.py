@@ -26,6 +26,9 @@ DEFAULT_MAPPINGS = (
 # 未配置 Cookie 时尝试复用的本地登录态文件
 COOKIE_FALLBACK = "/config/temp/115_cookie.json"
 
+# 本地登录态文件也不存在时，复用同账号 115 存储插件里保存的登录态
+COOKIE_SOURCE_PLUGIN = "P115Disk"
+
 
 class P115AutoUpload(_PluginBase):
     """115 自动上传插件主类。"""
@@ -39,7 +42,7 @@ class P115AutoUpload(_PluginBase):
         "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/"
         "src/assets/images/misc/u115.png"
     )
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_label = "云盘,上传,115"
     plugin_author = "local"
     plugin_config_prefix = "p115autoupload_"
@@ -82,8 +85,25 @@ class P115AutoUpload(_PluginBase):
         cookie = str(config.get("cookie") or "").strip()
         if not cookie:
             cookie = self._load_fallback_cookie()
+            if cookie:
+                logger.info("115自动上传：Cookie 为空，已使用本地登录态文件")
         if not cookie:
-            logger.warning("115自动上传：未配置 115 Cookie，插件不会执行上传")
+            cookie = self._load_disk_cookie()
+            if cookie:
+                logger.info(
+                    f"115自动上传：Cookie 为空，已复用 {COOKIE_SOURCE_PLUGIN} 的登录态"
+                )
+        if not cookie:
+            logger.error(
+                "115自动上传：未获取到 115 Cookie（配置为空、本地登录态文件不存在、"
+                f"无法复用 {COOKIE_SOURCE_PLUGIN}），插件不会执行上传"
+            )
+            self._notify_text(
+                "115 自动上传 - 缺少 Cookie",
+                "未获取到 115 Cookie：插件配置为空、本地登录态文件不存在，"
+                f"也无法复用 {COOKIE_SOURCE_PLUGIN} 的登录态。\n"
+                "插件已停止上传，请在插件配置中填写 115 Cookie 或完成 115 登录后重载插件。",
+            )
             return
         if not self._mappings:
             logger.warning("115自动上传：未配置路径映射，插件不会执行上传")
@@ -115,6 +135,20 @@ class P115AutoUpload(_PluginBase):
                 return "; ".join(f"{key}={value}" for key, value in data.items())
         except Exception as err:  # noqa: BLE001
             logger.warning(f"115自动上传：读取本地登录态失败：{err}")
+        return ""
+
+    @staticmethod
+    def _load_disk_cookie() -> str:
+        """复用 115 存储插件配置中的登录态，读取失败时返回空字符串。"""
+        try:
+            from app.sdk.plugin.manager import PluginManager
+
+            conf = PluginManager().get_plugin_config(COOKIE_SOURCE_PLUGIN) or {}
+            return str(conf.get("cookie") or "").strip()
+        except Exception as err:  # noqa: BLE001
+            logger.warning(
+                f"115自动上传：读取 {COOKIE_SOURCE_PLUGIN} 登录态失败：{err}"
+            )
         return ""
 
     def get_state(self) -> bool:
@@ -200,7 +234,8 @@ class P115AutoUpload(_PluginBase):
                     ),
                     self._section(
                         "115 连接",
-                        f"Cookie 留空时自动读取 {COOKIE_FALLBACK}。",
+                        f"Cookie 留空时依次读取 {COOKIE_FALLBACK} 与 "
+                        f"{COOKIE_SOURCE_PLUGIN} 的登录态。",
                         [
                             {
                                 "component": "VTextField",
@@ -213,7 +248,8 @@ class P115AutoUpload(_PluginBase):
                                     "class": "mb-4",
                                     "placeholder": "UID=...; CID=...; SEID=...; KID=...",
                                     "persistent-hint": True,
-                                    "hint": f"留空时读取 {COOKIE_FALLBACK}",
+                                    "hint": f"留空时读取 {COOKIE_FALLBACK}，"
+                                    f"再复用 {COOKIE_SOURCE_PLUGIN} 的登录态",
                                 },
                             }
                         ],
