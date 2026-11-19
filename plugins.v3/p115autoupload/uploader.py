@@ -38,6 +38,9 @@ BIG_FILE_THRESHOLD = 4 * 1024**3
 # 失败计数最多保留的条目数，避免插件数据无限增长
 FAIL_RECORD_LIMIT = 500
 
+# 同名但大小不同的文件最多记录的提示条数，避免插件数据过大
+CONFLICT_RECORD_LIMIT = 50
+
 
 class P115PeerCache:
     """按目录缓存 115 网盘的子目录与文件清单。"""
@@ -326,41 +329,8 @@ class P115Uploader:
                 continue
 
             remote_files = dict(self.cache.files_of(cid))
-            remote_videos = {
-                name: size
-                for name, size in remote_files.items()
-                if os.path.splitext(name)[1].lower() in VIDEO_SUFFIXES
-            }
-            local_videos = [
-                (name, os.path.getsize(local))
-                for local, name in items
-                if os.path.splitext(name)[1].lower() in VIDEO_SUFFIXES
-                and os.path.exists(local)
-            ]
-            matched = [
-                name
-                for name, size in local_videos
-                if remote_videos.get(name) is not None
-                and abs(int(remote_videos[name]) - size) <= 1024
-            ]
-
-            if self.dedup and local_videos:
-                if len(matched) == len(local_videos):
-                    duplicates.append(
-                        {"dir": remote_dir, "reason": "115 已存在全部视频文件"}
-                    )
-                    report["skipped"] += len(items)
-                    for _, item_name in items:
-                        self._clear_failure(f"{remote_dir}/{item_name}")
-                    continue
-                if len(local_videos) == 1 and remote_videos:
-                    duplicates.append(
-                        {"dir": remote_dir, "reason": "115 已存在同名影片（版本不同）"}
-                    )
-                    report["skipped"] += len(items)
-                    for _, item_name in items:
-                        self._clear_failure(f"{remote_dir}/{item_name}")
-                    continue
+            # 逐文件比对：已存在且大小一致的文件跳过，缺失文件逐个补传。
+            # 不再因为视频齐全就跳过整个目录，否则后补的图片、NFO 与字幕永远传不上去。
 
             for local_path, name in items:
                 remote_key = f"{remote_dir}/{name}"
@@ -386,6 +356,18 @@ class P115Uploader:
                     continue
                 existing = remote_files.get(name)
                 if existing is not None and abs(int(existing) - size) <= 1024:
+                    report["skipped"] += 1
+                    self._clear_failure(remote_key)
+                    continue
+                if existing is not None and self.dedup:
+                    # 同名但大小不同：按用户偏好视为已存在，不产生重复文件，仅提示
+                    if len(duplicates) < CONFLICT_RECORD_LIMIT:
+                        duplicates.append(
+                            {
+                                "dir": remote_dir,
+                                "reason": f"115 已存在同名文件（大小不同）：{name}",
+                            }
+                        )
                     report["skipped"] += 1
                     self._clear_failure(remote_key)
                     continue

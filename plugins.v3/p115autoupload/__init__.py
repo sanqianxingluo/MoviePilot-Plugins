@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -14,6 +15,7 @@ from app.schemas.types import EventType
 from app.sdk.events import Event, eventmanager
 from app.sdk.logging import logger
 from app.sdk.plugin import _PluginBase
+from app.sdk.scheduler import add_plugin_once_job, remove_plugin_once_job
 
 from .uploader import P115Uploader, VIDEO_SUFFIXES
 
@@ -29,6 +31,9 @@ COOKIE_FALLBACK = "/config/temp/115_cookie.json"
 # 本地登录态文件也不存在时，复用同账号 115 存储插件里保存的登录态
 COOKIE_SOURCE_PLUGIN = "P115Disk"
 
+# 延迟上传时间的上限，7 天，单位秒
+MAX_DELAY_SECONDS = 7 * 24 * 3600
+
 
 class P115AutoUpload(_PluginBase):
     """115 自动上传插件主类。"""
@@ -36,13 +41,13 @@ class P115AutoUpload(_PluginBase):
     plugin_name = "115自动上传"
     plugin_desc = (
         "监听 MoviePilot 整理完成事件，把新入库的影视文件自动上传到 115 网盘；"
-        "上传前校验 115 是否已存在，重复时不上传并发送提示。"
+        "上传前逐文件比对，只补传缺失或大小不一致的文件；可设置延迟上传避免整理错误。"
     )
     plugin_icon = (
         "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/"
         "src/assets/images/misc/u115.png"
     )
-    plugin_version = "1.1.2"
+    plugin_version = "1.1.3"
     plugin_label = "云盘,上传,115"
     plugin_author = "sanqianxingluo"
     plugin_config_prefix = "p115autoupload_"
@@ -55,6 +60,7 @@ class P115AutoUpload(_PluginBase):
     _include_sidecar = True
     _max_workers = 1
     _max_fail_count = 3
+    _delay_seconds = 0
     _mappings = DEFAULT_MAPPINGS
     _uploader: Optional[P115Uploader] = None
     _executor: Optional[ThreadPoolExecutor] = None
@@ -64,6 +70,7 @@ class P115AutoUpload(_PluginBase):
         super().__init__()
         self._lock = threading.Lock()
         self._pending: set[str] = set()
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
 
     def init_plugin(self, config: dict = None) -> None:
         """读取配置并初始化上传器与后台线程池。"""
@@ -77,6 +84,9 @@ class P115AutoUpload(_PluginBase):
         self._max_workers = max(1, min(4, int(config.get("max_workers") or 1)))
         self._max_fail_count = max(
             0, min(20, int(config.get("max_fail_count", 3) or 0))
+        )
+        self._delay_seconds = max(
+            0, min(MAX_DELAY_SECONDS, int(config.get("delay_seconds") or 0))
         )
         self._mappings = str(config.get("mappings") or DEFAULT_MAPPINGS).strip()
         if not config.get("enabled"):
@@ -228,6 +238,15 @@ class P115AutoUpload(_PluginBase):
                                         6,
                                         {"type": "number", "min": 0, "max": 20},
                                     ),
+                                    self._text(
+                                        "delay_seconds",
+                                        "延迟上传（秒）",
+                                        "整理完成后延迟该时间再上传，避免整理错误后重新整理产生多余文件；"
+                                        "取值 0-604800（7 天），0 表示立即上传",
+                                        12,
+                                        6,
+                                        {"type": "number", "min": 0, "max": 604800},
+                                    ),
                                 ],
                             }
                         ],
@@ -281,8 +300,9 @@ class P115AutoUpload(_PluginBase):
                             "variant": "tonal",
                             "class": "mt-2",
                             "text": (
-                                "整理完成后自动上传对应文件。115 已存在同版本时不上传并通知；"
-                                "只缺部分集数时仅补传缺失文件；同一文件失败次数达到上限后停止上传，"
+                                "整理完成后自动上传对应文件。上传前逐文件比对，只补传缺失或大小不一致的文件；"
+                                "可设置延迟上传时间（最长 7 天），避免整理错误重新整理时上传多余文件；"
+                                "同一文件失败次数达到上限后停止上传，"
                                 "可在插件详情页清空失败记录后重新尝试。"
                             ),
                         },
@@ -298,6 +318,7 @@ class P115AutoUpload(_PluginBase):
             "mappings": DEFAULT_MAPPINGS,
             "max_workers": 1,
             "max_fail_count": 3,
+            "delay_seconds": 0,
         }
 
     @staticmethod
@@ -423,6 +444,23 @@ class P115AutoUpload(_PluginBase):
                 },
             }
         ]
+        with self._lock:
+            scheduled_count = len(self._scheduled)
+        if self._delay_seconds > 0 or scheduled_count:
+            content.append(
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "info",
+                        "variant": "tonal",
+                        "class": "mb-4",
+                        "text": (
+                            f"延迟上传：{self._delay_seconds} 秒｜"
+                            f"排队中 {scheduled_count} 个任务"
+                        ),
+                    },
+                }
+            )
         if duplicates:
             lines = [f"{item['dir']}（{item['reason']}）" for item in duplicates[:10]]
             content.append(
@@ -514,6 +552,14 @@ class P115AutoUpload(_PluginBase):
 
     def stop_service(self) -> None:
         """停止后台线程池并释放上传器。"""
+        with self._lock:
+            scheduled = list(self._scheduled)
+            self._scheduled.clear()
+        for job_id in scheduled:
+            try:
+                remove_plugin_once_job(self.__class__.__name__, job_id)
+            except Exception as err:  # noqa: BLE001
+                logger.warning(f"115自动上传：取消延迟任务 {job_id} 失败：{err}")
         executor = self._executor
         self._executor = None
         self._uploader = None
@@ -551,11 +597,44 @@ class P115AutoUpload(_PluginBase):
             or "未知媒体"
         )
         key = f"{title}|{','.join(sorted(paths))}"
+        self._schedule_upload(title, paths, key)
+
+    @staticmethod
+    def _job_id(key: str) -> str:
+        """把任务标识转换为调度器可用的稳定任务 ID。"""
+        return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+
+    def _schedule_upload(self, title: str, paths: List[str], key: str) -> None:
+        """按配置的延迟时间提交上传任务，延迟为 0 时直接进入后台线程池。"""
+        if self._delay_seconds > 0:
+            job_id = self._job_id(key)
+            scheduled = add_plugin_once_job(
+                pid=self.__class__.__name__,
+                job_id=job_id,
+                func=self._run_upload,
+                name=f"115自动上传 {title}",
+                delay_seconds=self._delay_seconds,
+                func_kwargs={"title": title, "paths": paths, "key": key},
+            )
+            if scheduled:
+                with self._lock:
+                    self._scheduled[job_id] = {
+                        "title": title,
+                        "paths": paths,
+                        "delay": self._delay_seconds,
+                        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                logger.info(
+                    f"115自动上传：{title} 已加入延迟队列，{self._delay_seconds} 秒后上传"
+                )
+                return
+            logger.warning("115自动上传：延迟任务注册失败，改为立即上传")
         with self._lock:
             if key in self._pending:
                 return
             self._pending.add(key)
         try:
+            assert self._executor is not None
             self._executor.submit(self._run_upload, title, paths, key)
         except Exception as err:  # noqa: BLE001
             with self._lock:
@@ -581,6 +660,8 @@ class P115AutoUpload(_PluginBase):
 
     def _run_upload(self, title: str, paths: List[str], key: str) -> None:
         """执行一次上传并记录结果、发送通知。"""
+        with self._lock:
+            self._scheduled.pop(self._job_id(key), None)
         uploader = self._uploader
         try:
             if uploader is None:
